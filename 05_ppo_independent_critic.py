@@ -20,10 +20,19 @@ import torch.nn.functional as F
 from lfm import initialize, initialize_critic
 
 
-def load_jsonl(path):
+def load_jsonl(path,vocab_size=65536):
     """JSON Lines with prompt_ids/answer_ids from the OFFICIAL LFM tokenizer."""
     with open(path,encoding='utf8') as f:
-        return [json.loads(line) for line in f if line.strip()]
+        records=[json.loads(line) for line in f if line.strip()]
+    if not records:
+        raise ValueError('Data must contain at least one record')
+    for record in records:
+        for key in ('prompt_ids', 'answer_ids'):
+            ids=record.get(key) if isinstance(record,dict) else None
+            if (not isinstance(ids,list) or not ids
+                or any(type(i) is not int or not 0<=i<vocab_size for i in ids)):
+                raise ValueError(f'{key} must contain nonempty integer token IDs in [0, {vocab_size})')
+    return records
 
 
 def positions_log_probs(policy,prompt,actions,allowed_ids=None):
@@ -59,6 +68,10 @@ def positions_values(critic,prompt,actions):
 @torch.no_grad()
 def sample_tokens(policy,prompt,max_new=6,eos=7,temperature=1.0,allowed_ids=None):
     """Autoregressive multinomial rollout; deliberately no KV cache for clarity."""
+    if temperature!=1.0:
+        raise ValueError('temperature must be 1.0 to match positions_log_probs')
+    if max_new<1 or not prompt:
+        raise ValueError('Sampling requires a nonempty prompt and max_new >= 1')
     device=next(policy.parameters()).device
     actions=[]
     for _ in range(max_new):
@@ -135,12 +148,8 @@ def rollout(actor,critic,reference,record,max_new,allowed,beta=0.02):
     score=token_reward(actions,record['answer_ids'])
     rewards=-beta*(old_lp-ref_lp)
     rewards[-1]+=score
-    if actions[-1]==7: # EOS means terminal: no future value.
-        bootstrap=old_v.new_zeros(())
-    else:
-        # Token limit is truncation; bootstrap from the INDEPENDENT critic.
-        ids=torch.tensor([prompt+actions],dtype=torch.long,device=old_v.device)
-        bootstrap=critic(ids)[0,-1]
+    # EOS or token limit ends this scored-answer task; no future reward remains.
+    bootstrap=old_v.new_zeros(())
     advantages,returns=gae(rewards,old_v,bootstrap)
     return dict(prompt=prompt,actions=actions,old_lp=old_lp.detach(),
                 old_values=old_v.detach(),advantages=advantages.detach(),
@@ -178,6 +187,8 @@ def ppo_update(actor,critic,actor_opt,critic_opt,batch,allowed,
 
 def main():
     args=common_args('Pure PyTorch LFM2.5-230M PPO with independent critic').parse_args()
+    if args.max_new<1:
+        raise ValueError('--max-new must be at least 1')
     torch.manual_seed(args.seed)
     actor,device=initialize(args.tiny,args.checkpoint)
     critic,_=initialize_critic(args.tiny,args.checkpoint,device=device)
@@ -186,7 +197,7 @@ def main():
     critic_lr=args.lr if args.critic_lr is None else args.critic_lr
     critic_opt=torch.optim.AdamW(critic.parameters(),lr=critic_lr)
     if args.data:
-        records=load_jsonl(args.data)
+        records=load_jsonl(args.data,actor.model.embed_tokens.num_embeddings)
     elif args.tiny:
         records=[{'prompt_ids':[1,22,33],'answer_ids':[10]}]
     else:

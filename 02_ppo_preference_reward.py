@@ -20,10 +20,19 @@ import torch.nn.functional as F
 from lfm import cfg, initialize
 
 
-def load_jsonl(path):
+def load_jsonl(path,vocab_size=65536):
     """JSON Lines: one dict per line, numeric token ids from OFFICIAL tokenizer."""
     with open(path,encoding='utf8') as f:
-        return [json.loads(line) for line in f if line.strip()]
+        records=[json.loads(line) for line in f if line.strip()]
+    if not records:
+        raise ValueError('Data must contain at least one record')
+    for record in records:
+        for key in ('prompt_ids', 'chosen_ids', 'rejected_ids'):
+            ids=record.get(key) if isinstance(record,dict) else None
+            if (not isinstance(ids,list) or not ids
+                or any(type(i) is not int or not 0<=i<vocab_size for i in ids)):
+                raise ValueError(f'{key} must contain nonempty integer token IDs in [0, {vocab_size})')
+    return records
 
 
 def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
@@ -53,6 +62,10 @@ def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
 @torch.no_grad()
 def sample_tokens(policy,prompt,max_new=6,eos=7,temperature=1.0,allowed_ids=None):
     """Autoregressive multinomial rollout; deliberately no KV cache for clarity."""
+    if temperature!=1.0:
+        raise ValueError('temperature must be 1.0 to match positions_log_probs')
+    if max_new<1 or not prompt:
+        raise ValueError('Sampling requires a nonempty prompt and max_new >= 1')
     device=next(policy.parameters()).device
     actions=[]
     for _ in range(max_new):
@@ -116,6 +129,7 @@ class LearnedReward(nn.Module):
         super().__init__()
         self.backbone=copy.deepcopy(pretrained_actor.model).eval().requires_grad_(False)
         self.head=nn.Linear(c['dim'],1).to(next(pretrained_actor.parameters()).device)
+        self.register_buffer('score_center',self.head.weight.new_zeros(()))
 
     def forward(self,prompt,response):
         # Head sees the FULL prompt and candidate answer representation.
@@ -146,6 +160,11 @@ def train_reward_model(rm,records,epochs=5,lr=1e-3):
         print(f'reward_model epoch={epoch+1} preference_loss={loss.item():.4f} '
               f'score_chosen={chosen.item():+.3f} score_rejected={rejected.item():+.3f}')
     rm.eval().requires_grad_(False)
+    # Fix the otherwise unidentified score offset before applying tanh in PPO.
+    with torch.no_grad():
+        scores=[rm(r['prompt_ids'],r[key]) for r in records
+                for key in ('chosen_ids','rejected_ids')]
+        rm.score_center.copy_(torch.stack(scores).mean())
 
 
 def gae(rewards,values,bootstrap,gamma=0.99,lam=0.95):
@@ -167,15 +186,11 @@ def rollout(actor,reference,rm,prompt,max_new,allowed,beta=0.02):
     actions=sample_tokens(actor,prompt,max_new=max_new,allowed_ids=allowed)
     old_lp,old_v=positions_log_probs(actor,prompt,actions,critic=True,allowed_ids=allowed)
     ref_lp,_=positions_log_probs(reference,prompt,actions,allowed_ids=allowed)
-    score=torch.tanh(rm(prompt,actions)).item() # bound [-1,1] for toy stability
+    score=torch.tanh(rm(prompt,actions)-rm.score_center).item() # centered, bounded reward
     rewards=-beta*(old_lp-ref_lp)
     rewards[-1]+=score
-    if actions[-1]==7:
-        boot=old_v.new_zeros(())
-    else:
-        ids=torch.tensor([prompt+actions],device=old_v.device)
-        _,values=actor(ids,with_values=True)
-        boot=values[0,-1].detach()
+    # EOS or token limit ends this scored-answer task; no future reward remains.
+    boot=old_v.new_zeros(())
     advantages,returns=gae(rewards,old_v,boot)
     return dict(prompt=prompt,actions=actions,old_lp=old_lp.detach(),
                 advantages=advantages.detach(),returns=returns.detach(),
@@ -206,11 +221,15 @@ def main():
     a=common_args('LFM2.5-230M PPO with learned pairwise preference reward model')
     a.add_argument('--rm-epochs',type=int,default=3)
     args=a.parse_args()
+    if args.max_new<1:
+        raise ValueError('--max-new must be at least 1')
+    if args.rm_epochs<1:
+        raise ValueError('--rm-epochs must be at least 1 to train the preference reward model')
     torch.manual_seed(args.seed)
     actor,device=initialize(args.tiny,args.checkpoint,critic=True)
     reference=copy.deepcopy(actor).eval().requires_grad_(False)
     if args.data:
-        prefs=load_jsonl(args.data)
+        prefs=load_jsonl(args.data,actor.model.embed_tokens.num_embeddings)
     elif args.tiny:
         prefs=[{'prompt_ids':[1,22,33],'chosen_ids':[10],'rejected_ids':[11]},
                {'prompt_ids':[1,34,35],'chosen_ids':[10],'rejected_ids':[12]}]

@@ -21,6 +21,7 @@ def module(file,name):
     return mod
 
 ppo=module('01_ppo_deterministic.py','ppo')
+ppo_preference=module('02_ppo_preference_reward.py','ppo_preference')
 grpo=module('03_grpo.py','grpo')
 rlvr=module('04_rlvr_code_verifier.py','rlvr')
 independent=module('05_ppo_independent_critic.py','independent')
@@ -132,7 +133,7 @@ assert critic.value_head.weight.grad.abs().sum()>0
 assert all(p.grad is None for p in actor.parameters())
 critic.zero_grad(set_to_none=True)
 
-# 9. EOS has zero bootstrap; truncation uses the separate critic's end-state value.
+# 9. EOS and token limit both finish the scored-answer task: zero bootstrap.
 reference=copy.deepcopy(actor).eval().requires_grad_(False)
 record={'prompt_ids':prompt,'answer_ids':[10]}
 allowed=[7,10,11,12]
@@ -142,10 +143,8 @@ assert batch['score']==1.0
 assert torch.allclose(batch['returns'][-1],torch.tensor(1.0),atol=1e-6)
 with patch.object(independent,'sample_tokens',return_value=[10,11]):
     truncated=independent.rollout(actor,critic,reference,record,2,allowed)
-with torch.no_grad():
-    bootstrap=critic(torch.tensor([prompt+[10,11]]))[0,-1]
 assert torch.allclose(truncated['returns'][-1],
-                      truncated['rewards'][-1]+0.99*bootstrap,atol=1e-6)
+                      truncated['rewards'][-1],atol=1e-6)
 for result in (batch,truncated):
     for key in ('old_lp','old_values','advantages','returns','rewards'):
         assert result[key].shape==(2,)
@@ -229,4 +228,61 @@ for model,before in ((rm,rm_before),(reference,reference_before)):
     for name,p in model.named_parameters():
         assert torch.equal(p,before[name]),name
         assert p.grad is None
-print('All architecture, PPO/GRPO, preference reward, independent critic, safetensors, and verifier smoke tests PASSED.')
+# 14. Reject function metadata outside the verifier's plain two-argument grammar.
+for source in ('@unsupported()\ndef solve(a,b):\n    return a+b',
+               'def solve(a,b=0):\n    return a+b',
+               'def solve(a,b,*,c=0):\n    return a+b',
+               'def solve(a,b,*args):\n    return a+b',
+               'def solve(a,b,**kwargs):\n    return a+b',
+               'def solve(a:int,b):\n    return a+b',
+               'def solve(a,b)->int:\n    return a+b',
+               'def solve(a,/,b):\n    return a+b'):
+    assert rlvr.verify_unit_tests(source,tests)==0.0,source
+
+# 15. Centered preference rewards are invariant to a shared raw-score offset.
+torch.manual_seed(42)
+ppo_actor,_=lfm.initialize(tiny=True,critic=True,device='cpu')
+ppo_reference=copy.deepcopy(ppo_actor).eval().requires_grad_(False)
+ppo_rm=ppo_preference.LearnedReward(ppo_actor,lfm.cfg(tiny=True))
+ppo_preference.train_reward_model(ppo_rm,prefs,epochs=1)
+with torch.no_grad():
+    expected_center=torch.stack([ppo_rm(prompt,[10]),ppo_rm(prompt,[11])]).mean()
+    assert torch.allclose(ppo_rm.score_center,expected_center,atol=1e-6)
+    before=torch.tanh(ppo_rm(prompt,[10])-ppo_rm.score_center)
+    ppo_rm.head.bias.add_(10.)
+    ppo_rm.score_center.add_(10.)
+    after=torch.tanh(ppo_rm(prompt,[10])-ppo_rm.score_center)
+assert torch.allclose(before,after,atol=1e-6)
+ppo_allowed=[7,10,11,12]
+for actions in ([10,7],[10]):
+    with patch.object(ppo,'sample_tokens',return_value=actions):
+        result=ppo.rollout(ppo_actor,ppo_reference,record,len(actions),ppo_allowed)
+    assert torch.allclose(result['returns'][-1],result['rewards'][-1],atol=1e-6)
+    with patch.object(ppo_preference,'sample_tokens',return_value=actions):
+        result=ppo_preference.rollout(ppo_actor,ppo_reference,ppo_rm,prompt,len(actions),ppo_allowed)
+    assert torch.allclose(result['returns'][-1],torch.tensor(result['score']),atol=1e-6)
+
+# 16. Sampling cannot silently disagree with rescoring or emit empty trajectories.
+for script in (ppo,ppo_preference,grpo,rlvr,independent,grpo_preference):
+    for kwargs in ({'temperature':0.5},{'max_new':0},{'prompt':[]}):
+        try:
+            script.sample_tokens(actor,**({'prompt':prompt}|kwargs))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'{script.__name__} accepted invalid sampling options')
+    with tempfile.TemporaryDirectory() as tmp:
+        path=Path(tmp)/'data.jsonl'
+        valid={'prompt_ids':prompt,'answer_ids':[10],'chosen_ids':[10],
+               'rejected_ids':[11],'tests':tests}
+        path.write_text(json.dumps(valid)+'\n')
+        assert script.load_jsonl(path,vocab_size=96)==[valid]
+        for row in (None,{}, {'prompt_ids':[]}, {'prompt_ids':[96]}, {'prompt_ids':[True]}):
+            path.write_text('' if row is None else json.dumps(row)+'\n')
+            try:
+                script.load_jsonl(path,vocab_size=96)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'{script.__name__} accepted invalid data: {row}')
+print('All architecture, PPO/GRPO, preference reward, independent critic, safetensors, verifier, and audit regression tests PASSED.')

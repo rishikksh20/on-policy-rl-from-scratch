@@ -1271,6 +1271,92 @@
       .motion-mobile {
         display: none;
       }
+
+      .learning-notebook {
+        margin-bottom: 24px;
+        padding: 24px;
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+      .notation-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+        gap: 14px 24px;
+        margin: 18px 0 0;
+      }
+      .notation-grid > div {
+        min-width: 0;
+        padding-top: 11px;
+        border-top: 1px solid var(--line);
+      }
+      .notation-grid dt {
+        color: var(--blue);
+        font: 600 12px/1.7 var(--mono);
+      }
+      .notation-grid dd {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 5px 0 0;
+      }
+      .equation-sequence {
+        display: grid;
+        gap: 12px;
+        margin-top: 17px;
+      }
+      .learning-equation {
+        border-left: 3px solid #c1d1be;
+        background: #f6f8f3;
+        padding: 14px 16px;
+        border-radius: 0 7px 7px 0;
+      }
+      .learning-equation p {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 7px;
+      }
+      .formula {
+        font: 12px/1.9 var(--mono);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .step-equations {
+        grid-column: 1/-1;
+        min-width: 0;
+      }
+      .replay-equation-heading {
+        font: 10px var(--mono);
+        color: #f1bc83;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-top: 18px;
+      }
+      .replay-equation {
+        margin-top: 10px;
+        background: #203b48;
+        border: 1px solid #41606d;
+        border-radius: 7px;
+        padding: 12px;
+      }
+      .replay-equation strong {
+        display: block;
+        color: #d5e8ec;
+        font-size: 11px;
+        margin-bottom: 6px;
+      }
+      .replay-equation .formula {
+        color: #c5dced;
+        font-size: 11px;
+      }
+      .replay-equation .worked-substitution {
+        color: #bad9c6;
+        font-size: 11px;
+        line-height: 1.8;
+        margin-top: 9px;
+        padding-top: 9px;
+        border-top: 1px solid #ffffff20;
+      }
+
       @media (min-width: 1500px) {
         .shell {
           grid-template-columns: 260px minmax(0, 1fr);
@@ -1787,7 +1873,7 @@
             "ppo_update → actor loss + 0.5 × value loss; two epochs",
           ],
           assumptions:
-            "The visual credit example uses a terminal response and omits KL for clarity. The script uses γ=0.99, λ=0.95, β=0.02 and ε=0.2. Its token-limit path both assigns an outcome score and bootstraps future value; the task boundary needs an explicit interpretation.",
+            "The visual credit example uses a terminal response and omits KL for clarity. The script uses γ=0.99, λ=0.95, β=0.02 and ε=0.2. EOS and the token limit both end this scored-answer task, with zero bootstrap.",
           command: "python 01_ppo_deterministic.py --tiny --steps 3 --lr 0.001",
         },
         p02: {
@@ -1840,8 +1926,8 @@
             step(
               "Score",
               "Convert the judge score into reward",
-              "Script 02 applies tanh to the raw reward-model score. This bounds the outcome reward between −1 and +1 before it is added at the final response token.",
-              "The score scale and offset matter after tanh.",
+              "Script 02 uses R = tanh(Sψ(x,y) − c_RM). The fixed c_RM is the mean score of labeled chosen / rejected answers after reward-head training. R is added only at the final token.",
+              "Centering cancels a shared score offset. Score scale still affects tanh saturation.",
             ),
             step(
               "PPO",
@@ -1864,11 +1950,11 @@
           functions: [
             "train_reward_model → pairwise softplus loss; train only rm.head",
             "LearnedReward.forward → final hidden state of prompt + response",
-            "rollout → tanh(RM score) + reference penalty; compute GAE",
+            "rollout → R = tanh(Sψ − c_RM), reference shaping, then fixed Aₜ and Tₜ",
             "ppo_update → shared actor / critic optimization",
           ],
           assumptions:
-            "The visual pair scores are illustrative. Pairwise labels identify score differences, not an absolute reward origin. Applying tanh to uncalibrated raw scores can make arbitrary score offsets affect PPO rewards.",
+            "The visual pair scores are illustrative. Pairwise labels identify score differences, not an absolute origin. The script centers frozen scores before tanh; this fixes shared offsets but does not establish calibration or remove score-scale effects.",
           command:
             "python 02_ppo_preference_reward.py --tiny --steps 3 --lr 0.001",
         },
@@ -2380,7 +2466,7 @@
       };
       const termHelp = {
         reward:
-          "<b>Reward r:</b> feedback assigned by the task’s checker or learned judge. A high reward does not by itself say how surprising the result was.",
+          "<b>Outcome reward R:</b> feedback assigned by the task’s checker or learned judge. A high reward does not by itself say how surprising the result was.",
         baseline:
           "<b>Baseline b:</b> the comparison point. A one-step critic predicts expected reward; a GRPO group provides an empirical mean.",
         advantage:
@@ -2463,17 +2549,17 @@
       }
       function equationMarkup(kind) {
         if (kind === "advantage")
-          return `${term("advantage", "A", "green")} = ${term("reward", "r", "orange")} − ${term("baseline", "b", "violet")}`;
+          return `${term("advantage", "A", "green")} = ${term("reward", "R", "orange")} − ${term("baseline", "b", "violet")}`;
         if (kind === "ppo")
-          return `J<sub>clip</sub> = ${term("clip", "min", "blue")} [ ${term("ratio", "ρ")} · ${term("advantage", "A", "green")}, clip(ρ, 1−ε, 1+ε) · A ]`;
+          return `Jₜ = ${term("clip", "min", "blue")} [ ${term("ratio", "ρ")} · ${term("advantage", "A", "green")}, clip(ρ, 1−ε, 1+ε) · A ]`;
         if (kind === "preference")
-          return `P(chosen ≻ rejected) = ${term("sigmoid", "sigmoid")} ( ${term("margin", "Δ = s⁺ − s⁻", "orange")} )`;
+          return `P(chosen ≻ rejected) = ${term("sigmoid", "sigmoid")} ( ${term("margin", "Δ = S⁺ − S⁻", "orange")} )`;
         if (kind === "group" || kind === "learned-group")
-          return `${term("advantage", "Aᵢ", "green")} = ${frac(term("center", "rᵢ − μ", "orange"), term("spread", "σ + 10⁻⁶", "violet"))}`;
+          return `${term("advantage", "Aᵢ", "green")} = ${frac(term("center", "Rᵢ − μ", "orange"), term("spread", "σ + 10⁻⁶", "violet"))}`;
         if (kind === "verifier")
-          return `${term("verified", "rᵢ = 1 if all tests pass; else 0", "orange")} → ${term("advantage", "Aᵢ = (rᵢ − μ) / (σ + 10⁻⁶)", "green")}`;
+          return `${term("verified", "Rᵢ = 1 if all tests pass; else 0", "orange")} → ${term("advantage", "Aᵢ = (Rᵢ − μ) / (σ + 10⁻⁶)", "green")}`;
         if (kind === "independent")
-          return `${term("actorStep", "θ ← θ − α · ∇L_actor")} &nbsp; ${term("criticStep", "φ ← φ − αᵥ · ∇(cᵥ L_value)", "violet")}`;
+          return `${term("actorStep", "θ ← θ − α · ∇L_actor")} &nbsp; ${term("criticStep", "φ ← φ − αᵥ · ∇(cᵥ L_critic)", "violet")}`;
         if (kind === "backbone")
           return `${term("softmax", "π(token j | prefix)")} = ${frac("exp(zⱼ)", "Σₖ exp(zₖ)")}`;
         return `${term("causal", "sₜ = prompt ⊕ actions before t")} → π(aₜ | sₜ)`;
@@ -2482,14 +2568,14 @@
         return `<div class="lab-heading"><h3>A small push, with a limit</h3><span class="label-tag">Move the ratio</span></div><div class="lab-grid"><div>${slider("ratio", "Probability ratio ρ", 0.2, 1.8, 0.01, state.ratio)}${slider("advantage", "Advantage A", -1, 1, 0.05, state.advantage)}${slider("clip", "Clip width ε", 0.05, 0.4, 0.05, state.clip)}<div class="small">ρ = 1 means unchanged probability.<br>J is maximized; actor loss = −mean(J).</div></div><div><svg id="clip-plot" class="plot" viewBox="0 0 430 210" role="img" aria-label="Clipped and unclipped PPO objective versus probability ratio"></svg><div class="legend"><span><i></i>Clipped objective</span><span><i class="raw"></i>Unclipped ρA</span></div><div class="result" id="clip-result" aria-live="polite"></div></div></div>`;
       }
       function gaeLab() {
-        return `<div class="lab-heading"><h3>How credit travels back through tokens</h3><span class="label-tag">GAE explorer</span></div><p class="small" style="margin-bottom:16px">Three actions, values [0.2, 0.4, 0.6], rewards [0, 0, r]. KL omitted. Start with γ = λ = 1 to see simple return minus value.</p><div class="lab-grid"><div>${slider("ppoReward", "Final outcome score r", 0, 1, 1, state.ppoReward)}${slider("gamma", "Discount γ", 0, 1, 0.01, state.gamma)}${slider("lambda", "Trace decay λ", 0, 1, 0.01, state.lambda)}<label class="control"><span>How the rollout ends</span><select id="ending"><option value="eos" ${state.ending === "eos" ? "selected" : ""}>EOS · future value = 0</option><option value="limit" ${state.ending === "limit" ? "selected" : ""}>Token limit · future value = 0.7</option></select></label><button class="btn secondary" data-action="simple-gae">Set γ = λ = 1</button></div><div><div class="table-scroll"><table><caption class="sr-only">GAE rewards, values, residuals, advantages and returns by action</caption><thead><tr><th>Action</th><th>rₜ</th><th>V old</th><th>δₜ</th><th>Aₜ</th><th>Target</th></tr></thead><tbody id="gae-table"></tbody></table></div><div class="result" id="gae-result" aria-live="polite"></div></div></div><div class="mini-equation">δₜ = rₜ + γ V_old(sₜ₊₁) − V_old(sₜ)<br>Aₜ = δₜ + γλ Aₜ₊₁ &nbsp; · &nbsp; targetₜ = Aₜ + V_old(sₜ)</div>`;
+        return `<div class="lab-heading"><h3>How credit travels back through tokens</h3><span class="label-tag">GAE explorer</span></div><p class="small" style="margin-bottom:16px">Three actions, values [0.2, 0.4, 0.6], shaped rewards rₜ = [0, 0, R]. KL omitted. Start with γ = λ = 1 to see simple return minus value.</p><div class="lab-grid"><div>${slider("ppoReward", "Outcome reward R", 0, 1, 1, state.ppoReward)}${slider("gamma", "Discount γ", 0, 1, 0.01, state.gamma)}${slider("lambda", "Trace decay λ", 0, 1, 0.01, state.lambda)}<label class="control"><span>How the rollout ends</span><select id="ending"><option value="eos" ${state.ending === "eos" ? "selected" : ""}>EOS · future value = 0</option><option value="limit" ${state.ending === "limit" ? "selected" : ""}>Token limit · future value = 0</option></select></label><button class="btn secondary" data-action="simple-gae">Set γ = λ = 1</button></div><div><div class="table-scroll"><table><caption class="sr-only">GAE rewards, values, residuals, advantages and returns by action</caption><thead><tr><th>Action</th><th>rₜ</th><th>V old</th><th>δₜ</th><th>Aₜ</th><th>Target Tₜ</th></tr></thead><tbody id="gae-table"></tbody></table></div><div class="result" id="gae-result" aria-live="polite"></div></div></div><div class="mini-equation">δₜ = rₜ + γ V_old(sₜ₊₁) − V_old(sₜ)<br>Aₜ = δₜ + γλ Aₜ₊₁ &nbsp; · &nbsp; Tₜ = Aₜ + V_old(sₜ)</div>`;
       }
       function groupLab(learned = false) {
         return `<div class="lab-heading"><h3>${learned ? "Four answers, four judge scores" : "Four attempts at the same question"}</h3><span class="label-tag">${learned ? "Adjust scores" : "Click 0 / 1"}</span></div><div class="reward-cards">${Array.from({ length: 4 }, (_, i) => `<div class="reward-item"><label ${learned ? `for="score-${i}"` : ""}>Response ${i + 1}</label>${learned ? `<output data-score-out="${i}">${fixed(state.scores[i], 1)}</output><input id="score-${i}" type="range" data-score="${i}" aria-label="Reward-model score for response ${i + 1}" min="-6" max="6" step="0.1" value="${state.scores[i]}">` : `<button class="score-button" data-reward="${i}" aria-label="Toggle reward for response ${i + 1}"></button>`}</div>`).join("")}</div><div class="metrics" id="group-metrics"></div><div id="group-bars"></div><div class="button-row" style="margin-top:20px"><button class="btn secondary" data-action="group-reset">Mixed group</button><button class="btn secondary" data-action="group-tie">Make all scores equal</button>${learned ? '<button class="btn secondary" data-action="group-offset">Add +2 to every score</button>' : ""}</div><div class="result" id="group-result" aria-live="polite"></div>`;
       }
       function labMarkup(kind) {
         if (kind === "advantage")
-          return `<div class="lab-heading"><h3>Better than expected?</h3><span class="label-tag">A terminal, one-step task</span></div><div class="lab-grid"><div>${slider("reward", "Reward r", 0, 1, 0.05, state.reward)}${slider("baseline", "Expected reward b", 0, 1, 0.05, state.baseline)}</div><div><div id="advantage-bars"></div><div class="result" id="advantage-result" aria-live="polite"></div></div></div>`;
+          return `<div class="lab-heading"><h3>Better than expected?</h3><span class="label-tag">A terminal, one-step task</span></div><div class="lab-grid"><div>${slider("reward", "Outcome reward R", 0, 1, 0.05, state.reward)}${slider("baseline", "Expected reward b", 0, 1, 0.05, state.baseline)}</div><div><div id="advantage-bars"></div><div class="result" id="advantage-result" aria-live="polite"></div></div></div>`;
         if (kind === "ppo")
           return (
             gaeLab() +
@@ -2497,7 +2583,7 @@
             clipLab()
           );
         if (kind === "preference")
-          return `<div class="lab-heading"><h3>Make the preferred answer score higher</h3><span class="label-tag">Reward-head training</span></div><div class="lab-grid"><div>${slider("margin", "Chosen − rejected score Δ", -4, 4, 0.1, state.margin)}<p class="small">Hold the rejected score at 0. Move the chosen score. This is a margin illustration, not a simulated optimizer step.</p><div class="mini-equation">L_RM = −log(sigmoid(Δ))<br>= softplus(−Δ)</div></div><div><div id="preference-bars"></div><div class="metrics" id="preference-metrics"></div><div class="result" id="preference-result" aria-live="polite"></div></div></div><div class="note"><strong>Then freeze the judge.</strong> Script 02 uses tanh(raw RM score) as the PPO outcome reward, followed by the same GAE and clipped actor / critic update as lesson 01.</div>`;
+          return `<div class="lab-heading"><h3>Make the preferred answer score higher</h3><span class="label-tag">Reward-head training</span></div><div class="lab-grid"><div>${slider("margin", "Chosen − rejected score Δ", -4, 4, 0.1, state.margin)}<p class="small">Hold the rejected score at 0. Move the chosen score. This is a margin illustration, not a simulated optimizer step.</p><div class="mini-equation">L_RM = −log(sigmoid(Δ))<br>= softplus(−Δ)</div></div><div><div id="preference-bars"></div><div class="metrics" id="preference-metrics"></div><div class="result" id="preference-result" aria-live="polite"></div></div></div><div class="note"><strong>Then freeze the judge.</strong> Script 02 uses R = tanh(Sψ(x,y) − c_RM) as the PPO outcome reward, followed by the same GAE and clipped actor / critic update as lesson 01.</div>`;
         if (kind === "group" || kind === "learned-group")
           return groupLab(kind === "learned-group");
         if (kind === "verifier")
@@ -2519,15 +2605,510 @@
             "",
           )}</div><pre id="data-schema"></pre><div style="margin-top:22px"><label class="control"><span>Inspect the next response action <output id="prefix-out"></output></span><input type="range" min="0" max="2" step="1" id="prefix-index" value="${state.prefix}" aria-label="Response action index"></label><div id="prefix-tokens"></div><div class="result" id="prefix-result" aria-live="polite"></div></div>`;
       }
+      // The equation notebook and replay share these exact definitions and symbols.
+      const learningTerms = {
+        state: [
+          "x, yᵢ, sᵢₜ, aᵢₜ",
+          "Prompt, response i, prefix before token t, and the sampled token. We omit i when showing one response.",
+        ],
+        policy: [
+          "πθ, π_old, π_ref",
+          "Current actor, cached rollout policy, and frozen reference. θ contains actor parameters.",
+        ],
+        outcome: [
+          "Rᵢ (or R for one response)",
+          "One outcome reward for a whole response. This differs from the per-token shaped reward rₜ.",
+        ],
+        critic: [
+          "Vφ(sₜ), V_old(sₜ)",
+          "Current and cached critic predictions of future shaped return. φ contains critic parameters.",
+        ],
+        credit: [
+          "δₜ, Aₜ, Tₜ",
+          "TD residual, fixed advantage, and fixed critic target. Aᵢ is one advantage shared by all tokens of GRPO response i.",
+        ],
+        clip: [
+          "ρₜ, ε, Jₜ",
+          "Current / old action-probability ratio, clip width (0.2), and clipped surrogate contribution.",
+        ],
+        losses: [
+          "L_actor, L_critic, L_total",
+          "Losses are minimized. L_critic includes ½; PPO uses cᵥ = 0.5 as an additional weight.",
+        ],
+        rm: [
+          "Sψ(x,y), S⁺, S⁻, Δ, L_RM",
+          "Raw scalar score, chosen / rejected scores, their margin Δ = S⁺ − S⁻, and pairwise training loss. ψ is the reward head; its backbone is frozen.",
+        ],
+        center: [
+          "c_RM",
+          "Fixed mean of chosen / rejected raw scores after reward-head training. PPO centers scores before tanh.",
+        ],
+        group: [
+          "μ, σ, G, Aᵢ",
+          "Same-prompt group mean, population standard deviation, group size, and response advantage shared by its tokens.",
+        ],
+        regularization: [
+          "β, γ, λ",
+          "Reference penalty weight (0.02), PPO discount (0.99), and GAE trace decay (0.95).",
+        ],
+        kl: [
+          "dᵢₜ, k̂ᵢₜ",
+          "Reference / current log-probability difference and nonnegative sampled reference penalty.",
+        ],
+        actorLoss: [
+          "L_actor",
+          "Actor loss to minimize. In GRPO it includes the clipped policy term and sampled reference penalty; there is no critic loss.",
+        ],
+        reference: [
+          "β",
+          "Weight of the frozen-reference penalty, set to 0.02 in these scripts.",
+        ],
+        baseline: [
+          "b, A",
+          "Baseline and one-step advantage A = R − b. A positive A encourages the sampled action.",
+        ],
+        backbone: [
+          "hₜ, zⱼ",
+          "Contextual hidden state at a prefix and logit for candidate next token j.",
+        ],
+      };
+      const learningEquations = {
+        sample: {
+          title: "Sample actions",
+          formula: "sₜ = x ⊕ a₁:ₜ₋₁;  aₜ ~ π_old(· | sₜ)",
+          text: "Save sampled actions and their old log probabilities before optimizer updates.",
+        },
+        exact: {
+          title: "Outcome reward",
+          formula: "R = 1 if sampled answer IDs match target IDs; otherwise 0",
+          text: "Strip one trailing EOS before comparison. Both EOS and the token limit finish this scored answer.",
+        },
+        rmOutput: {
+          title: "Reward-model output",
+          formula: "Sψ(x,y) = Linearψ(Backbone_frozen(x ⊕ y)_last) ∈ ℝ",
+          text: "The output is an unbounded scalar score for the full answer, not a correctness probability or a critic value.",
+        },
+        rmLoss: {
+          title: "Train the reward head",
+          formula:
+            "Δ = Sψ(x,y⁺) − Sψ(x,y⁻)\nP(y⁺ ≻ y⁻ | x) = sigmoid(Δ)\nL_RM = −log(sigmoid(Δ)) = softplus(−Δ)",
+          text: "Minimize L_RM on chosen / rejected pairs. Then freeze ψ before actor training.",
+        },
+        rmCenter: {
+          title: "PPO outcome reward",
+          formula:
+            "c_RM = mean raw score of labeled chosen / rejected answers\nR = tanh(Sψ(x,y) − c_RM)",
+          text: "Compute c_RM once after reward-head training and keep it fixed. Centering removes a shared score offset; it does not calibrate quality or remove scale effects.",
+        },
+        rmRaw: {
+          title: "GRPO outcome reward",
+          formula: "Rᵢ = Sψ(x,yᵢ)",
+          text: "Use the frozen reward model’s raw score. Group normalization cancels a common additive offset.",
+        },
+        verify: {
+          title: "Verified outcome reward",
+          formula:
+            "Rᵢ = 1 if program i is allowed and passes every test; otherwise 0",
+          text: "The task’s tests define measured success. No gradient passes through the verifier.",
+        },
+        shaped: {
+          title: "Per-token shaped reward",
+          formula:
+            "rₜ = −β[log π_old(aₜ|sₜ) − log π_ref(aₜ|sₜ)] + 1[t = final] R",
+          text: "The outcome reward R appears once at the end. The reference penalty contributes at each sampled token.",
+        },
+        gae: {
+          title: "PPO advantages and critic targets",
+          formula:
+            "δₜ = rₜ + γ V_old(sₜ₊₁) − V_old(sₜ)\nAₜ = δₜ + γλ Aₜ₊₁;  Tₜ = Aₜ + V_old(sₜ)",
+          text: "Work backward, with A after the final token = 0 and final next-state value = 0. Freeze Aₜ and Tₜ throughout the PPO epochs.",
+        },
+        group: {
+          title: "GRPO advantages",
+          formula:
+            "μ = meanᵢ Rᵢ;  σ = sqrt(meanᵢ (Rᵢ − μ)²)\nAᵢ = (Rᵢ − μ) / (σ + 10⁻⁶)",
+          text: "Compare responses to the same prompt. The same Aᵢ is used at every token of response i. Equal rewards give zero advantages.",
+        },
+        ratio: {
+          title: "Current / old probability ratio",
+          formula: "ρₜ = exp(log πθ(aₜ|sₜ) − log π_old(aₜ|sₜ))",
+          text: "Score the exact same actions and prefixes. This ratio uses π_old, not π_ref; collection and rescoring both use temperature 1.",
+        },
+        surrogate: {
+          title: "Clipped actor contribution",
+          formula: "Jₜ = min(ρₜ Aₜ, clip(ρₜ, 1−ε, 1+ε) Aₜ)",
+          text: "Jₜ is maximized. Clipping flattens excessive gains in the favored direction; it is not a hard bound on probabilities.",
+        },
+        actor: {
+          title: "Actor loss",
+          formula: "L_actor = −meanₜ Jₜ",
+          text: "Minimize the negative surrogate. Cached advantages and old log probabilities remain fixed.",
+        },
+        critic: {
+          title: "Critic loss",
+          formula: "L_critic = ½ meanₜ (Vφ(sₜ) − Tₜ)²",
+          text: "Fit current value predictions to frozen targets Tₜ. This is regression toward return, not preference ranking.",
+        },
+        total: {
+          title: "Shared PPO update",
+          formula: "L_total = L_actor + cᵥ L_critic;  cᵥ = 0.5",
+          text: "One optimizer updates the shared backbone and both heads from this combined loss.",
+        },
+        separate: {
+          title: "Independent PPO updates",
+          formula:
+            "Actor optimizer minimizes L_actor over θ\nCritic optimizer minimizes cᵥ L_critic over φ;  cᵥ = 0.5",
+          text: "Separate parameter tensors, backward passes, and optimizers. Neither loss updates the other model.",
+        },
+        kl: {
+          title: "Sampled reference penalty",
+          formula:
+            "dᵢₜ = log π_ref(aᵢₜ|sᵢₜ) − log πθ(aᵢₜ|sᵢₜ)\nk̂ᵢₜ = exp(dᵢₜ) − dᵢₜ − 1",
+          text: "The reference stays frozen. On cached old-policy actions, this is a sampled surrogate, not an exact full-vocabulary current-policy KL.",
+        },
+        grpoActor: {
+          title: "GRPO actor loss — no critic",
+          formula:
+            "Jᵢₜ = min(ρᵢₜ Aᵢ, clip(ρᵢₜ, 1−ε, 1+ε) Aᵢ)\nL_actor = meanᵢ meanₜ [−Jᵢₜ + β k̂ᵢₜ]",
+          text: "First average tokens inside each response, then average responses. Only the actor is optimized; there is no L_critic or L_total in this loop.",
+        },
+        oneStep: {
+          title: "One-step comparison",
+          formula: "A = R − b",
+          text: "This completed-response illustration omits future rewards and reference penalties.",
+        },
+        oneStepActor: {
+          title: "Actor-loss intuition",
+          formula: "L_actor = −A log πθ(a|s)",
+          text: "One-step policy-gradient intuition: positive A encourages the sampled action. The PPO / GRPO lessons add ratios, clipping and regularization.",
+        },
+        refresh: {
+          title: "Refresh the rollout",
+          formula:
+            "New samples ~ updated πθ;  new π_old log probabilities cached\nπ_ref stays frozen;  any trained Sψ stays frozen",
+          text: "Refresh samples and their fixed targets after the update epochs, not between epochs on the same rollout.",
+        },
+        softmax: {
+          title: "Actor output",
+          formula: "z = LM_head(hₜ);  πθ(j|sₜ) = exp(zⱼ) / Σₖ exp(zₖ)",
+          text: "A vocabulary distribution sums to 1. The actor samples an action from it.",
+        },
+        heads: {
+          title: "Scalar outputs",
+          formula:
+            "Critic: Vφ(sₜ) = Value_head(hₜ)\nReward model: Sψ(x,y) = Reward_head(h_last)",
+          text: "A critic sees a pre-action prefix and predicts return. The reward model sees the full answer and is trained on preferences.",
+        },
+        align: {
+          title: "Causal alignment",
+          formula:
+            "Input = prompt + actions[:-1]\nRead logits at positions P−1 … P+T−2\nTargets = a₁ … a_T",
+          text: "P is the prompt length and T is the number of sampled actions. Each target action is paired with the state before that action.",
+        },
+      };
+      const learningPlans = {
+        overview: {
+          terms: ["state", "policy", "outcome", "baseline", "rm", "actorLoss"],
+          equations: ["sample", "oneStep", "oneStepActor"],
+          stages: [
+            ["sample"],
+            ["sample"],
+            ["oneStep"],
+            ["oneStep"],
+            ["oneStepActor"],
+            ["refresh"],
+          ],
+        },
+        p01: {
+          terms: [
+            "state",
+            "policy",
+            "outcome",
+            "critic",
+            "credit",
+            "clip",
+            "losses",
+            "regularization",
+          ],
+          equations: [
+            "sample",
+            "exact",
+            "shaped",
+            "gae",
+            "ratio",
+            "surrogate",
+            "actor",
+            "critic",
+            "total",
+          ],
+          stages: [
+            ["sample"],
+            ["exact", "shaped"],
+            ["gae"],
+            ["ratio", "surrogate", "actor"],
+            ["critic", "total"],
+            ["refresh"],
+          ],
+        },
+        p02: {
+          terms: [
+            "state",
+            "policy",
+            "rm",
+            "center",
+            "outcome",
+            "critic",
+            "credit",
+            "clip",
+            "losses",
+            "regularization",
+          ],
+          equations: [
+            "rmOutput",
+            "rmLoss",
+            "rmCenter",
+            "shaped",
+            "gae",
+            "ratio",
+            "surrogate",
+            "actor",
+            "critic",
+            "total",
+          ],
+          stages: [
+            ["rmOutput", "rmLoss"],
+            ["rmLoss"],
+            ["rmCenter"],
+            ["sample"],
+            ["rmOutput", "rmCenter", "shaped"],
+            ["gae", "actor", "critic", "total"],
+          ],
+        },
+        p03: {
+          terms: [
+            "state",
+            "policy",
+            "outcome",
+            "group",
+            "clip",
+            "kl",
+            "actorLoss",
+            "reference",
+          ],
+          equations: ["sample", "exact", "group", "ratio", "kl", "grpoActor"],
+          stages: [
+            ["sample"],
+            ["exact"],
+            ["group"],
+            ["group"],
+            ["ratio", "kl", "grpoActor"],
+            ["refresh"],
+          ],
+        },
+        p04: {
+          terms: [
+            "state",
+            "policy",
+            "outcome",
+            "group",
+            "clip",
+            "kl",
+            "actorLoss",
+            "reference",
+          ],
+          equations: ["sample", "verify", "group", "ratio", "kl", "grpoActor"],
+          stages: [
+            ["sample"],
+            ["verify"],
+            ["verify"],
+            ["verify"],
+            ["group"],
+            ["grpoActor", "refresh"],
+          ],
+        },
+        p05: {
+          terms: [
+            "state",
+            "policy",
+            "outcome",
+            "critic",
+            "credit",
+            "clip",
+            "losses",
+            "regularization",
+          ],
+          equations: [
+            "sample",
+            "exact",
+            "shaped",
+            "gae",
+            "ratio",
+            "surrogate",
+            "actor",
+            "critic",
+            "separate",
+          ],
+          stages: [
+            ["separate"],
+            ["sample"],
+            ["shaped", "gae"],
+            ["ratio", "actor", "separate"],
+            ["critic", "separate"],
+            ["refresh"],
+          ],
+        },
+        p06: {
+          terms: [
+            "state",
+            "policy",
+            "rm",
+            "outcome",
+            "group",
+            "clip",
+            "kl",
+            "actorLoss",
+            "reference",
+          ],
+          equations: [
+            "rmOutput",
+            "rmLoss",
+            "rmRaw",
+            "group",
+            "ratio",
+            "kl",
+            "grpoActor",
+          ],
+          stages: [
+            ["rmOutput", "rmLoss"],
+            ["rmRaw"],
+            ["sample"],
+            ["rmOutput", "rmRaw"],
+            ["group"],
+            ["grpoActor", "refresh"],
+          ],
+        },
+        lfm: {
+          terms: ["state", "policy", "backbone", "critic", "rm"],
+          equations: ["softmax", "heads"],
+          stages: [
+            ["sample"],
+            ["softmax"],
+            ["softmax"],
+            ["heads"],
+            ["softmax", "sample"],
+          ],
+        },
+        prep: {
+          terms: ["state", "policy", "outcome", "rm"],
+          equations: ["sample", "align"],
+          stages: [
+            ["align"],
+            ["align"],
+            ["exact", "rmLoss", "verify"],
+            ["sample"],
+            ["align"],
+          ],
+        },
+      };
+      function learningNotebook() {
+        const plan = learningPlans[current];
+        const equationKeys = [
+          ...new Set([...plan.equations, ...plan.stages.flat()]),
+        ];
+        return `<div class="learning-notebook"><h3>Define the terms before using them</h3><p class="small">These symbols keep the same meaning in the explorer and every replay step. i indexes responses; t indexes generated tokens.</p><dl class="notation-grid">${plan.terms
+          .map((key) => {
+            const [symbol, meaning] = learningTerms[key];
+            return `<div><dt>${esc(symbol)}</dt><dd>${esc(meaning)}</dd></div>`;
+          })
+          .join(
+            "",
+          )}</dl><h3 style="margin-top:25px">The equations, in learning order</h3><p class="small">Read the inputs and outputs first, then the actor loss and any critic loss. Every loss below is minimized.</p><div class="equation-sequence">${equationKeys
+          .map((key, i) => {
+            const e = learningEquations[key];
+            return `<div class="learning-equation" data-equation="${key}"><div class="card-label">${String(i + 1).padStart(2, "0")} / ${e.title}</div><div class="formula">${esc(e.formula)}</div><p>${esc(e.text)}</p></div>`;
+          })
+          .join("")}</div></div>`;
+      }
+      function replayWorkedValues(key) {
+        const isPPO = ["p01", "p02", "p05"].includes(current);
+        if (isPPO) {
+          const R =
+            current === "p02"
+              ? Math.tanh(1.2 - 0.2)
+              : current === "p01"
+                ? scenario === "success"
+                  ? 1
+                  : 0
+                : 1;
+          const g = gaeValues(
+            [0, R],
+            [0.4, 0.6],
+            0,
+            current === "p01" ? state.gamma : 0.99,
+            current === "p01" ? state.lambda : 0.95,
+          );
+          const J = g.a.map((A) => clipValue(state.ratio, A, state.clip));
+          const actor = -J.reduce((a, b) => a + b, 0) / J.length;
+          const critic =
+            (0.5 *
+              g.returns.reduce(
+                (sum, T, i) => sum + ([0.4, 0.6][i] - T) ** 2,
+                0,
+              )) /
+            g.returns.length;
+          if (key === "gae")
+            return `Two-token terminal example, reference penalty omitted: R = ${fixed(R, 3)}, V_old = [0.4, 0.6]. δ = [${g.delta.map((v) => signed(v, 3)).join(", ")}], A = [${g.a.map((v) => signed(v, 3)).join(", ")}], T = [${g.returns.map((v) => fixed(v, 3)).join(", ")}].`;
+          if (key === "actor" || key === "surrogate")
+            return `Using that two-token example and illustrative ρₜ = ${fixed(state.ratio)} at both tokens: J = [${J.map((v) => signed(v, 3)).join(", ")}]; L_actor = ${signed(actor, 3)}.`;
+          if (key === "critic")
+            return `At Vφ = [0.4, 0.6] and fixed T = [${g.returns.map((v) => fixed(v, 3)).join(", ")}], L_critic = ${fixed(critic, 3)}.`;
+          if (key === "total")
+            return `L_total = ${signed(actor, 3)} + 0.5 × ${fixed(critic, 3)} = ${signed(actor + 0.5 * critic, 3)}. Both losses can update the shared backbone.`;
+          if (key === "rmCenter")
+            return `Illustrative frozen scores: Sψ = 1.2, c_RM = 0.2 → R = tanh(1.0) = ${fixed(R, 3)}. R is bounded; Sψ is not.`;
+        }
+        if (key === "rmLoss") {
+          const margin = current === "p02" ? state.margin : 1.5;
+          return `Illustrative preference pair: Δ = ${signed(margin)}, P(chosen ≻ rejected) = ${fixed(100 / (1 + Math.exp(-margin)), 1)}%, L_RM = ${fixed(Math.log1p(Math.exp(-margin)), 3)}.`;
+        }
+        if (key === "group" || key === "grpoActor") {
+          const values =
+            current === "p03"
+              ? state.rewards
+              : current === "p04"
+                ? ["a+b", "a-b", "a*b", "a"].map((p) => verifyCode(p).reward)
+                : state.scores;
+          const g = groupStats(values);
+          if (key === "group")
+            return `R = [${values.map((v) => fixed(v, 1)).join(", ")}] → μ = ${fixed(g.mean, 3)}, σ = ${fixed(g.std, 3)}, A = [${g.advantages.map((v) => signed(v, 3)).join(", ")}].`;
+          return `For response 1 at illustrative ρ₁ₜ = 1 and k̂₁ₜ = 0: each token contributes −A₁ = ${signed(-g.advantages[0], 3)}. The full L_actor averages all responses’ token contributions.`;
+        }
+        if (key === "oneStep")
+          return `R = ${fixed(state.reward)}, b = ${fixed(state.baseline)} → A = ${signed(state.reward - state.baseline)}.`;
+        if (key === "oneStepActor")
+          return `If πθ(a|s) = 0.25, L_actor = −(${signed(state.reward - state.baseline)}) log(0.25) = ${signed(-(state.reward - state.baseline) * Math.log(0.25), 3)}.`;
+        return "";
+      }
+
+      function replayEquations() {
+        const keys = learningPlans[current].stages[frame];
+        return `<div class="replay-equation-heading">Equations used in this step</div>${keys
+          .map((key) => {
+            const e = learningEquations[key];
+            return `<div class="replay-equation" data-replay-equation="${key}"><strong>${e.title}</strong><div class="formula">${esc(e.formula)}</div>${replayWorkedValues(key) ? `<p class="worked-substitution">${esc(replayWorkedValues(key))}</p>` : ""}</div>`;
+          })
+          .join("")}`;
+      }
+
       function extraMath(kind) {
         if (kind === "ppo")
-          return "ρₜ = exp(log π_current(aₜ|sₜ) − log π_old(aₜ|sₜ))\nrₜ = −β(log π_old − log π_ref) + 1[t = final] × outcome\nL_actor = −meanₜ min(ρₜAₜ, clip(ρₜ, 1−ε, 1+ε)Aₜ)\nL_value = ½ meanₜ (V_current(sₜ) − targetₜ)²\nL_total = L_actor + cᵥ L_value; cᵥ = 0.5\nOld log probabilities, advantages and targets remain fixed across PPO epochs.";
+          return "ρₜ = exp(log πθ(aₜ|sₜ) − log π_old(aₜ|sₜ))\nrₜ = −β(log π_old − log π_ref) + 1[t = final] × R\nL_actor = −meanₜ min(ρₜAₜ, clip(ρₜ, 1−ε, 1+ε)Aₜ)\nL_critic = ½ meanₜ (Vφ(sₜ) − Tₜ)²\nL_total = L_actor + cᵥ L_critic; cᵥ = 0.5\nOld log probabilities, advantages and targets remain fixed across PPO epochs.";
         if (["group", "learned-group", "verifier"].includes(kind))
-          return "μ = meanᵢ rᵢ; σ = sqrt(meanᵢ (rᵢ − μ)²)\nρᵢₜ = exp(log π_current − log π_old)\ndᵢₜ = log π_ref − log π_current\nk̂ᵢₜ = exp(dᵢₜ) − dᵢₜ − 1\nL = meanᵢ meanₜ [−min(ρᵢₜAᵢ, clip(ρᵢₜ, 1−ε, 1+ε)Aᵢ) + β k̂ᵢₜ]\nThe scripts average tokens within a response, then average responses.\nThe nonnegative sampled KL expression is a surrogate on cached old-policy actions during update epochs; it is not the exact full-vocabulary KL.";
+          return "μ = meanᵢ Rᵢ; σ = sqrt(meanᵢ (Rᵢ − μ)²)\nρᵢₜ = exp(log πθ − log π_old)\ndᵢₜ = log π_ref − log πθ\nk̂ᵢₜ = exp(dᵢₜ) − dᵢₜ − 1\nL_actor = meanᵢ meanₜ [−min(ρᵢₜAᵢ, clip(ρᵢₜ, 1−ε, 1+ε)Aᵢ) + β k̂ᵢₜ]\nThe scripts average tokens within a response, then average responses.\nThe nonnegative sampled KL expression is a surrogate on cached old-policy actions during update epochs; it is not the exact full-vocabulary KL.";
         if (kind === "preference")
-          return "Δ = RM(prompt, chosen) − RM(prompt, rejected)\nP(chosen ≻ rejected) = sigmoid(Δ)\nL_RM = softplus(−Δ)\nAfter RM training: freeze RM; outcome reward = tanh(RM(prompt, sampled_response)).\nThen use PPO’s shaped rewards, GAE and actor / critic losses from lesson 01.";
+          return "Δ = Sψ(prompt, chosen) − Sψ(prompt, rejected)\nP(chosen ≻ rejected) = sigmoid(Δ)\nL_RM = softplus(−Δ)\nAfter RM training: freeze RM; outcome reward R = tanh(Sψ(prompt, sampled_response) − c_RM).\nThen use PPO’s shaped rewards, GAE and actor / critic losses from lesson 01.";
         if (kind === "independent")
-          return "L_actor = −mean min(ρA, clip(ρ, 1−ε, 1+ε)A)\nL_value = ½ mean (V_φ − fixed_target)²\nActor optimizer sees θ only; critic optimizer sees φ only.\nCritic backward uses cᵥ L_value with cᵥ = 0.5.\nActor and critic targets are fixed during both update epochs.";
+          return "L_actor = −mean min(ρA, clip(ρ, 1−ε, 1+ε)A)\nL_critic = ½ mean (Vφ − Tₜ)²\nActor optimizer sees θ only; critic optimizer sees φ only.\nCritic backward uses cᵥ L_critic with cᵥ = 0.5.\nActor and critic targets are fixed during both update epochs.";
         return null;
       }
       function renderLesson() {
@@ -2537,7 +3118,7 @@
           extra = extraMath(l.lab);
         $("#chapter-counter").textContent = `Lesson ${l.number} / 08`;
         $("#lesson").innerHTML =
-          `<article aria-labelledby="lesson-title"><header class="hero"><div class="eyebrow">${l.number} / ${l.tag}</div><h1 id="lesson-title">${l.title}</h1><p class="lede">${l.lede}</p><div class="pills">${l.pills.map(([color, label]) => `<span class="pill ${color}">${label}</span>`).join("")}</div></header><nav class="lesson-path" aria-label="Within this lesson"><a href="#idea"><b>01</b>Understand the idea</a><a href="#equation"><b>02</b>Explore the equation</a><a href="#process"><b>03</b>Watch the process</a></nav><section id="idea" class="lesson-section" style="margin-top:0"><div class="section-head"><span class="section-n">01</span><div><h2>The idea, in plain language</h2></div></div><div class="concept-grid"><div class="card idea-card"><div class="card-label">${current === "overview" ? "The central idea" : "What this technique changes"}</div><h3>${l.ideaTitle}</h3><p>${l.idea}</p></div><div class="card example-card"><div class="card-label">A concrete example</div><div class="quote">${l.example}</div><p>${l.exampleText}</p></div></div>${current === "overview" ? overviewMap() : ""}</section><section id="equation" class="lesson-section"><div class="section-head"><span class="section-n">02</span><div><h2>${l.mathTitle}</h2><p>${l.mathSub}</p></div></div><div class="card equation-card"><div class="equation-top"><div class="card-label">Click a colored part to read it</div><div class="equation">${equationMarkup(l.lab)}</div><div class="term-help" aria-live="polite"></div></div><div class="lab-body">${labMarkup(l.lab)}</div>${extra ? `<details class="extra-math"><summary>See the full learning objective and fixed quantities</summary><pre>${esc(extra)}</pre></details>` : ""}</div></section><section id="process" class="lesson-section"><div class="section-head"><span class="section-n">03</span><div><h2>${l.processTitle}</h2><p>${l.processSub}</p></div></div><div class="process"><div class="process-toolbar"><span class="tag">A worked example / step by step</span><div class="button-row"><button class="btn secondary" data-action="back" aria-label="Previous animation step">← Back</button><button class="btn" data-action="play" aria-pressed="false">▶ Play</button><button class="btn secondary" data-action="next">Next →</button><button class="btn secondary" data-action="reset" aria-label="Reset animation">↺ Reset</button><select id="speed" aria-label="Animation speed"><option value="4000">Slow</option><option value="2600" selected>Normal</option><option value="1400">Fast</option></select></div></div><div class="process-rail" aria-label="Animation steps">${l.steps.map((s, i) => `<button class="beat" data-frame="${i}" aria-current="false"><span>${i + 1}</span>${s.label}</button>`).join("")}</div><div class="process-body"><div class="world" id="world"></div><div class="scene-text" aria-live="polite"><div class="step-count" id="step-count"></div><h3 id="step-title"></h3><p id="step-text"></p><div class="insight" id="step-insight"></div></div></div><div class="process-bottom"><span id="frame-label"></span><div class="process-progress"><span></span></div><span id="play-status">Paused · explore at your pace</span></div></div><p class="process-foot">The animation uses illustrative attempts and parameter changes. Controls in the equation explorer update the relevant worked examples. Use Next for a manual walkthrough.</p><div class="check"><h3>Check your intuition</h3><p class="small" style="margin-bottom:10px">${l.question}</p><div class="answers">${l.answers.map((answer, i) => `<button data-answer="${i}" aria-pressed="false">${answer}</button>`).join("")}</div><p class="feedback" role="status" hidden></p></div></section><details class="code-details"><summary>Connect the idea to ${l.file} &nbsp; ↗</summary><div class="code-inner"><a href="${l.file}">${l.file}</a><ol>${l.functions.map((f) => `<li><code>${esc(f)}</code></li>`).join("")}</ol><p><strong>Assumptions and simplifications.</strong> ${l.assumptions}</p><pre>${esc(l.command)}</pre><p>Tiny mode is a random-model smoke demonstration. It does not demonstrate pretrained-model quality or general learning performance.</p>${current === "lfm" ? '<p>Model dimensions and block sequence: <a href="https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/config.json" target="_blank" rel="noreferrer">official checkpoint configuration ↗</a>.</p>' : ""}</div></details><div class="chapter-links">${idx ? `<button data-go="${keys[idx - 1]}">← ${lessons[keys[idx - 1]].tag.split(" · ")[0]}</button>` : "<span></span>"}${idx < keys.length - 1 ? `<button data-go="${keys[idx + 1]}">Next: ${lessons[keys[idx + 1]].tag.split(" · ")[0]} →</button>` : '<button data-go="overview">Return to the learning loop ↺</button>'}</div></article>`;
+          `<article aria-labelledby="lesson-title"><header class="hero"><div class="eyebrow">${l.number} / ${l.tag}</div><h1 id="lesson-title">${l.title}</h1><p class="lede">${l.lede}</p><div class="pills">${l.pills.map(([color, label]) => `<span class="pill ${color}">${label}</span>`).join("")}</div></header><nav class="lesson-path" aria-label="Within this lesson"><a href="#idea"><b>01</b>Understand the idea</a><a href="#equation"><b>02</b>Explore the equation</a><a href="#process"><b>03</b>Watch the process</a></nav><section id="idea" class="lesson-section" style="margin-top:0"><div class="section-head"><span class="section-n">01</span><div><h2>The idea, in plain language</h2></div></div><div class="concept-grid"><div class="card idea-card"><div class="card-label">${current === "overview" ? "The central idea" : "What this technique changes"}</div><h3>${l.ideaTitle}</h3><p>${l.idea}</p></div><div class="card example-card"><div class="card-label">A concrete example</div><div class="quote">${l.example}</div><p>${l.exampleText}</p></div></div>${current === "overview" ? overviewMap() : ""}</section><section id="equation" class="lesson-section"><div class="section-head"><span class="section-n">02</span><div><h2>${l.mathTitle}</h2><p>${l.mathSub}</p></div></div>${learningNotebook()}<div class="card equation-card"><div class="equation-top"><div class="card-label">Click a colored part to read it</div><div class="equation">${equationMarkup(l.lab)}</div><div class="term-help" aria-live="polite"></div></div><div class="lab-body">${labMarkup(l.lab)}</div>${extra ? `<details class="extra-math"><summary>See the full learning objective and fixed quantities</summary><pre>${esc(extra)}</pre></details>` : ""}</div></section><section id="process" class="lesson-section"><div class="section-head"><span class="section-n">03</span><div><h2>${l.processTitle}</h2><p>${l.processSub}</p></div></div><div class="process"><div class="process-toolbar"><span class="tag">A worked example / step by step</span><div class="button-row"><button class="btn secondary" data-action="back" aria-label="Previous animation step">← Back</button><button class="btn" data-action="play" aria-pressed="false">▶ Play</button><button class="btn secondary" data-action="next">Next →</button><button class="btn secondary" data-action="reset" aria-label="Reset animation">↺ Reset</button><select id="speed" aria-label="Animation speed"><option value="4000">Slow</option><option value="2600" selected>Normal</option><option value="1400">Fast</option></select></div></div><div class="process-rail" aria-label="Animation steps">${l.steps.map((s, i) => `<button class="beat" data-frame="${i}" aria-current="false"><span>${i + 1}</span>${s.label}</button>`).join("")}</div><div class="process-body"><div class="world" id="world"></div><div class="scene-text" aria-live="polite"><div class="step-count" id="step-count"></div><h3 id="step-title"></h3><p id="step-text"></p><div class="insight" id="step-insight"></div><div class="step-equations" id="step-equations"></div></div></div><div class="process-bottom"><span id="frame-label"></span><div class="process-progress"><span></span></div><span id="play-status">Paused · explore at your pace</span></div></div><p class="process-foot">The animation uses illustrative attempts and parameter changes. Controls in the equation explorer update the relevant worked examples. Use Next for a manual walkthrough.</p><div class="check"><h3>Check your intuition</h3><p class="small" style="margin-bottom:10px">${l.question}</p><div class="answers">${l.answers.map((answer, i) => `<button data-answer="${i}" aria-pressed="false">${answer}</button>`).join("")}</div><p class="feedback" role="status" hidden></p></div></section><details class="code-details"><summary>Connect the idea to ${l.file} &nbsp; ↗</summary><div class="code-inner"><a href="${l.file}">${l.file}</a><ol>${l.functions.map((f) => `<li><code>${esc(f)}</code></li>`).join("")}</ol><p><strong>Assumptions and simplifications.</strong> ${l.assumptions}</p><pre>${esc(l.command)}</pre><p>Tiny mode is a random-model smoke demonstration. It does not demonstrate pretrained-model quality or general learning performance.</p>${current === "lfm" ? '<p>Model dimensions and block sequence: <a href="https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/config.json" target="_blank" rel="noreferrer">official checkpoint configuration ↗</a>.</p>' : ""}</div></details><div class="chapter-links">${idx ? `<button data-go="${keys[idx - 1]}">← ${lessons[keys[idx - 1]].tag.split(" · ")[0]}</button>` : "<span></span>"}${idx < keys.length - 1 ? `<button data-go="${keys[idx + 1]}">Next: ${lessons[keys[idx + 1]].tag.split(" · ")[0]} →</button>` : '<button data-go="overview">Return to the learning loop ↺</button>'}</div></article>`;
         $$(".term")[0]?.click();
         if (current === "p01") {
           const control = document.createElement("select");
@@ -2593,7 +3174,7 @@
           `<title>PPO surrogate objective: clipping limits gains in the favored direction</title><rect x="${x(1 - e)}" y="12" width="${x(1 + e) - x(1 - e)}" height="169" fill="#ecf2fb"/><line class="axis" x1="35" y1="${y(0)}" x2="407" y2="${y(0)}"/><line class="axis" x1="35" y1="12" x2="35" y2="181"/><text x="6" y="18">J</text><path class="raw-line" d="${path((v) => v * a)}"/><path class="clip-line" d="${path((v) => clipValue(v, a, e))}"/><line x1="${x(r)}" x2="${x(r)}" y1="12" y2="181" stroke="#a76a35" stroke-dasharray="3 4"/><circle cx="${x(r)}" cy="${y(clipValue(r, a, e))}" r="5" fill="#ac4a25"/>${[0.2, 0.8, 1, 1.2, 1.8].map((v) => `<text x="${x(v)}" y="199" text-anchor="middle">${fixed(v, 1)}</text>`).join("")}<text x="395" y="15" text-anchor="end">ε = ${fixed(e)}</text><text x="420" y="199">ρ</text>`;
         const clipped = Math.abs(clipValue(r, a, e) - r * a) > 1e-9;
         $("#clip-result").innerHTML =
-          `<strong>ρA = ${signed(r * a)} → J<sub>clip</sub> = ${signed(clipValue(r, a, e))}</strong><br>${a === 0 ? "Zero advantage supplies no outcome-policy gradient." : clipped ? "The objective is flat here: pushing farther in the favored direction adds no surrogate benefit." : a > 0 ? "Positive A encourages this sampled action. The gain flattens once ρ passes 1+ε." : "Negative A discourages this sampled action. The gain from lowering ρ flattens below 1−ε."}`;
+          `<strong>ρA = ${signed(r * a)} → Jₜ = ${signed(clipValue(r, a, e))}</strong><br>${a === 0 ? "Zero advantage supplies no outcome-policy gradient." : clipped ? "The objective is flat here: pushing farther in the favored direction adds no surrogate benefit." : a > 0 ? "Positive A encourages this sampled action. The gain flattens once ρ passes 1+ε." : "Negative A discourages this sampled action. The gain from lowering ρ flattens below 1−ε."}`;
       }
       function updateLab() {
         const kind = lessons[current].lab;
@@ -2610,7 +3191,7 @@
           const g = gaeValues(
             [0, 0, state.ppoReward],
             [0.2, 0.4, 0.6],
-            state.ending === "eos" ? 0 : 0.7,
+            0, // The scored-answer task ends at EOS or the token limit.
             state.gamma,
             state.lambda,
           );
@@ -2625,7 +3206,7 @@
             )
             .join("");
           $("#gae-result").innerHTML =
-            `<strong>Read from the last row backward.</strong> The last advantage is ${signed(g.a[2])}; earlier actions inherit later information through γλ.${state.ending === "limit" ? "<br>The limit example includes a 0.7 bootstrap <em>and</em> an outcome score, matching the script’s convention. Whether both belong here depends on the task boundary." : ""}`;
+            `<strong>Read from the last row backward.</strong> The last advantage is ${signed(g.a[2])}; earlier actions inherit later information through γλ.${state.ending === "limit" ? "<br>The token limit finishes this scored-answer task, so the bootstrap is 0, just as at EOS." : ""}`;
           drawClip();
         }
         if (kind === "preference") {
@@ -2709,7 +3290,7 @@
           });
           const schemas = {
             numeric:
-              '{\n  "prompt_ids": [P₁, P₂, …, Pₙ],\n  "answer_ids": [A₁, A₂, EOS]\n}',
+              '{\n  "prompt_ids": [P₁, P₂, …, Pₙ],\n  "answer_ids": [a₁, a₂, EOS]\n}',
             preferences:
               '{\n  "prompt_ids": [P₁, P₂, …, Pₙ],\n  "chosen_ids": [C₁, …, EOS],\n  "rejected_ids": [R₁, …, EOS]\n}',
             coding:
@@ -2717,7 +3298,7 @@
           };
           $("#data-schema").textContent = schemas[state.dataFormat];
           $("#prefix-out").textContent = `t = ${state.prefix + 1}`;
-          const actions = ["A₁", "A₂", "EOS"];
+          const actions = ["a₁", "a₂", "EOS"];
           $("#prefix-tokens").innerHTML =
             `<div class="mini-equation"><span class="violet">P₁ · P₂ · … · Pₙ</span> ${actions.map((a, i) => `<span style="${i < state.prefix ? "color:var(--blue)" : i === state.prefix ? "background:var(--green-bg);color:var(--green);padding:5px" : "color:#858e92"}">${a}</span>`).join(" → ")}</div>`;
           $("#prefix-result").innerHTML =
@@ -2867,7 +3448,7 @@
           const worlds = [
             `<div class="prompt">What is 2 + 3?</div><div class="node-row">${node("Actor", "π: distribution over next tokens", "lit")}${arrow}${node("Next token?", "5 · 4 · 6 · EOS")}</div>`,
             `<div class="prompt">What is 2 + 3?</div><div class="response">${tokens(["5", "EOS"])}</div><p class="small" style="margin-top:14px">One possible sampled response.</p>`,
-            `<div class="response">5 &nbsp; → &nbsp; feedback</div><div class="metrics">${metric(fixed(state.reward), "Reward r from explorer")}</div>`,
+            `<div class="response">5 &nbsp; → &nbsp; feedback</div><div class="metrics">${metric(fixed(state.reward), "Outcome reward R")}</div>`,
             `<div class="metrics">${metric(fixed(state.reward), "Received")}${metric(fixed(state.baseline), "Expected")}${metric(signed(a), "Advantage")}</div>${bars(["Advantage"], [a], { isSigned: true, max: 1, dark: true })}`,
             `<div class="response">${a > 0 ? "↑ Encourage sampled actions" : a < 0 ? "↓ Discourage sampled actions" : "No outcome-policy direction"}</div><div class="node-row">${node("Actor loss", "computed on fixed sampled actions", "lit")}${arrow}${node("Updated policy", "small parameter step", "lit")}</div>`,
             `<div class="node-row">${node("Updated actor", "sample a new response", "lit")}${arrow}${node("Feedback", "score the new attempt")}${arrow}${node("Repeat", "new rollout data")}</div><div class="mini-equation">Old rollout data refreshed.<br>Reference model stays fixed.</div>`,
@@ -2876,14 +3457,14 @@
         }
         if (current === "p01") {
           const r = scenario === "success" ? 1 : 0,
-            g = gaeValues([0, r], [0.4, 0.6], 0, 0.99, 0.95),
+            g = gaeValues([0, r], [0.4, 0.6], 0, state.gamma, state.lambda),
             a = g.a[0];
           const worlds = [
             `<div class="prompt">What is 2 + 3? Answer only the number.</div><div class="response">${tokens([scenario === "success" ? "5" : "4", "EOS"])}</div><p class="small" style="margin-top:12px">Old action log probabilities cached before updating.</p>`,
             `<div class="response">${scenario === "success" ? "5 = target ✓" : "4 ≠ target ✕"}</div><div class="metrics">${metric(r, "Outcome score")}${metric("[0, " + r + "]", "Rewards before KL shaping")}</div>`,
-            `<div class="response">${tokens([scenario === "success" ? "5" : "4", "EOS"], "credit")}</div>${bars(["V old (first)"], [0.4], { max: 1, dark: true })}${bars(["A (first)"], [a], { isSigned: true, max: 1, dark: true })}<div class="mini-equation">Two-token terminal example, KL omitted.<br>A₀ = ${signed(a, 3)}; target₀ = ${fixed(g.returns[0], 3)}</div>`,
+            `<div class="response">${tokens([scenario === "success" ? "5" : "4", "EOS"], "credit")}</div>${bars(["V old (first)"], [0.4], { max: 1, dark: true })}${bars(["A (first)"], [a], { isSigned: true, max: 1, dark: true })}<div class="mini-equation">Two-token terminal example, KL omitted.<br>A₁ = ${signed(a, 3)}; T₁ = ${fixed(g.returns[0], 3)}</div>`,
             `<div class="metrics">${metric(fixed(state.ratio), "Illustrative ratio ρ")}${metric(signed(a), "Fixed A for first action")}</div><div class="response">J = min(ρA, clip(ρ)A)</div><div class="mini-equation">J = ${signed(clipValue(state.ratio, a, state.clip), 3)}<br>Actor loss = −mean(J)</div>`,
-            `<div class="node-row">${node("Actor loss", "policy gradient", "lit")}${node("Value loss", "fit fixed return targets", "lit")}</div><div class="node-row">${node("Shared LFM backbone", "receives both gradient signals", "lit")}${arrow}${node("Two heads", "vocabulary + scalar value", "lit")}</div>`,
+            `<div class="node-row">${node("L_actor", "clipped policy loss", "lit")}${node("L_critic", "fit fixed Tₜ", "lit")}</div><div class="node-row">${node("Shared LFM backbone", "receives both gradient signals", "lit")}${arrow}${node("Two heads", "vocabulary + scalar value", "lit")}</div>`,
             `<div class="node-row">${node("Actor + critic", "updated shared parameters", "lit")}${arrow}${node("New rollout", "new actions / log probs")}${node("Reference", "frozen throughout", "frozen")}</div>`,
           ];
           return worlds[f];
@@ -2895,7 +3476,7 @@
             `<div class="node-row">${node("RM backbone", "frozen feature extractor", "frozen")}${arrow}${node("Reward head", "only trainable RM part", "lit")}</div><div class="metrics">${metric(fixed(state.margin), "Chosen − rejected margin")}${metric(fixed(p * 100, 1) + "%", "Predicted preference")}</div>`,
             `<div class="node-row">${node("Entire reward model", "frozen after pairwise training", "frozen")}${node("Actor + critic", "ready for PPO")}</div><div class="mini-equation">Stage 1 ends. Stage 2 begins.</div>`,
             `<div class="prompt">Same prompt, a fresh sampled reply</div><div class="response">${tokens(["I can", "check the tracking", "for you."])}</div><p class="small" style="margin-top:14px">Illustrative generated reply; not the annotated chosen answer.</p>`,
-            `<div class="node-row">${node("Sampled response", "full answer")}${arrow}${node("Frozen judge", "raw score = 1.2", "frozen")}</div><div class="metrics">${metric(fixed(Math.tanh(1.2), 3), "tanh(1.2) = outcome reward")}</div><p class="small">Fresh-response score is illustrative and separate from the pair margin.</p>`,
+            `<div class="node-row">${node("Sampled response", "full answer")}${arrow}${node("Frozen judge", "Sψ = 1.2; c_RM = 0.2", "frozen")}</div><div class="metrics">${metric(fixed(Math.tanh(1.2 - 0.2), 3), "R = tanh(Sψ − c_RM)")}</div><p class="small">Fresh-response score is illustrative and separate from the pair margin.</p>`,
             `<div class="node-row">${node("Actor", "clipped PPO objective", "lit")}${node("Critic", "fixed GAE targets", "lit")}${node("Reward model", "still frozen", "frozen")}${node("Reference", "still frozen", "frozen")}</div>`,
           ];
           return worlds[f];
@@ -2996,8 +3577,8 @@
           `<div class="prompt">What is 2 + 3? Answer only the number.</div><div class="node-row">${node("Task definition", "text prompt")}${node("Feedback", "target / preference / tests")}</div>`,
           `<div class="response" style="font-size:13px">BOS → user → question → assistant</div><div class="mini-equation">Official chat template creates prompt_ids.<br>IDs shown in this guide are symbolic.</div>`,
           `<div class="node-row">${node("Exact match", "answer_ids")}${node("Preferences", "chosen_ids + rejected_ids")}${node("Code", "tests: input → expected")}</div>`,
-          `<div class="prompt">prompt_ids → current actor</div><div class="response">${tokens(["A₁", "A₂", "EOS"])}</div><p class="small" style="margin-top:12px">These sampled response tokens are the RL actions.</p>`,
-          `<div class="response" style="font-size:13px">${tokens(["P₁", "P₂", "Pₙ"])} ${tokens(["A₁", "A₂"], "credit")}</div><div class="mini-equation">Input: prompt + actions[:-1]<br>Read positions: P−1 … P+T−2<br>Targets: A₁, A₂, EOS</div>`,
+          `<div class="prompt">prompt_ids → current actor</div><div class="response">${tokens(["a₁", "a₂", "EOS"])}</div><p class="small" style="margin-top:12px">These sampled response tokens are the RL actions.</p>`,
+          `<div class="response" style="font-size:13px">${tokens(["P₁", "P₂", "Pₙ"])} ${tokens(["a₁", "a₂"], "credit")}</div><div class="mini-equation">Input: prompt + actions[:-1]<br>Read positions: P−1 … P+T−2<br>Targets: a₁, a₂, EOS</div>`,
         ];
         return worlds[f];
       }
@@ -3014,6 +3595,7 @@
         $("#step-title").textContent = s.title;
         $("#step-text").textContent = s.text;
         $("#step-insight").textContent = s.insight;
+        $("#step-equations").innerHTML = replayEquations();
         const world = $("#world");
         world.classList.remove("reveal");
         world.innerHTML =

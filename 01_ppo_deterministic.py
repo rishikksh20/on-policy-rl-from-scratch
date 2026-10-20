@@ -20,10 +20,19 @@ import torch.nn.functional as F
 from lfm import LFMPolicy, cfg, initialize, read_safetensors
 
 
-def load_jsonl(path):
+def load_jsonl(path,vocab_size=65536):
     """JSON Lines: one dict per line, numeric token ids from OFFICIAL tokenizer."""
     with open(path,encoding='utf8') as f:
-        return [json.loads(line) for line in f if line.strip()]
+        records=[json.loads(line) for line in f if line.strip()]
+    if not records:
+        raise ValueError('Data must contain at least one record')
+    for record in records:
+        for key in ('prompt_ids', 'answer_ids'):
+            ids=record.get(key) if isinstance(record,dict) else None
+            if (not isinstance(ids,list) or not ids
+                or any(type(i) is not int or not 0<=i<vocab_size for i in ids)):
+                raise ValueError(f'{key} must contain nonempty integer token IDs in [0, {vocab_size})')
+    return records
 
 
 def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
@@ -53,6 +62,10 @@ def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
 @torch.no_grad()
 def sample_tokens(policy,prompt,max_new=6,eos=7,temperature=1.0,allowed_ids=None):
     """Autoregressive multinomial rollout; deliberately no KV cache for clarity."""
+    if temperature!=1.0:
+        raise ValueError('temperature must be 1.0 to match positions_log_probs')
+    if max_new<1 or not prompt:
+        raise ValueError('Sampling requires a nonempty prompt and max_new >= 1')
     device=next(policy.parameters()).device
     actions=[]
     for _ in range(max_new):
@@ -112,8 +125,8 @@ def gae(rewards, old_values, bootstrap, gamma=0.99, lam=0.95):
     A[t] = delta[t] + gamma * lam * A[t+1]
     critic_target[t] = A[t] + V_old(s[t]); all tensors frozen.
 
-    bootstrap=0 for terminal EOS; use V(state_after_last_token)
-    for truncated/nonterminal rollouts.
+    bootstrap=0 when the scored-answer task ends (EOS or token limit here).
+    Only use V(state_after_last_token) for a genuinely continuing trajectory.
     """
     ans=torch.zeros_like(rewards)
     next_a=rewards.new_zeros(())
@@ -136,12 +149,8 @@ def rollout(actor,reference,record,max_new,allowed,beta=0.02):
     score=token_reward(actions,record['answer_ids'])
     rewards=-beta*(old_lp-ref_lp)  # sampled KL regularization
     rewards[-1]+=score          # sparse final correctness reward
-    if actions[-1] == 7:       # EOS means terminal
-        bootstrap=old_v.new_zeros(())
-    else:
-        ids=torch.tensor([prompt+actions],device=old_v.device)
-        _,all_v=actor(ids,with_values=True)
-        bootstrap=all_v[0,-1].detach() # time limit is truncation, not terminal
+    # EOS or token limit ends this scored-answer task; no future reward remains.
+    bootstrap=old_v.new_zeros(())
     adv,returns=gae(rewards,old_v,bootstrap)
     return dict(prompt=prompt,actions=actions,old_lp=old_lp.detach(),
                 advantages=adv.detach(),returns=returns.detach(),
@@ -174,13 +183,15 @@ def ppo_update(actor,opt,batch,allowed,clip_eps=0.2,value_coef=0.5,epochs=2):
 
 def main():
     args=common_args('Pure PyTorch LFM2.5-230M PPO numeric reward').parse_args()
+    if args.max_new<1:
+        raise ValueError('--max-new must be at least 1')
     torch.manual_seed(args.seed)
     actor,device=initialize(args.tiny,args.checkpoint,critic=True)
     reference=copy.deepcopy(actor).eval().requires_grad_(False)
     # Only the actor + critic are optimized; reference is frozen.
     opt=torch.optim.AdamW(actor.parameters(),lr=args.lr)
     if args.data:
-        records=load_jsonl(args.data)
+        records=load_jsonl(args.data,actor.model.embed_tokens.num_embeddings)
     elif args.tiny:
         records=[{'prompt_ids':[1,22,33], 'answer_ids':[10]}]
     else:

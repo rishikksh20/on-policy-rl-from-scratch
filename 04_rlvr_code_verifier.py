@@ -21,10 +21,24 @@ import torch.nn.functional as F
 from lfm import initialize
 
 
-def load_jsonl(path):
+def load_jsonl(path,vocab_size=65536):
     """JSON Lines: one dict per line, numeric token ids from OFFICIAL tokenizer."""
     with open(path,encoding='utf8') as f:
-        return [json.loads(line) for line in f if line.strip()]
+        records=[json.loads(line) for line in f if line.strip()]
+    if not records:
+        raise ValueError('Data must contain at least one record')
+    for record in records:
+        for key in ('prompt_ids',):
+            ids=record.get(key) if isinstance(record,dict) else None
+            if (not isinstance(ids,list) or not ids
+                or any(type(i) is not int or not 0<=i<vocab_size for i in ids)):
+                raise ValueError(f'{key} must contain nonempty integer token IDs in [0, {vocab_size})')
+        tests=record.get('tests')
+        if (not isinstance(tests,list) or not tests
+            or any(not isinstance(t,dict) or any(type(t.get(k)) is not int
+                   for k in ('a','b','expected')) for t in tests)):
+            raise ValueError('tests must contain integer a, b, and expected fields')
+    return records
 
 
 def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
@@ -54,6 +68,10 @@ def positions_log_probs(policy,prompt,actions,critic=False,allowed_ids=None):
 @torch.no_grad()
 def sample_tokens(policy,prompt,max_new=6,eos=7,temperature=1.0,allowed_ids=None):
     """Autoregressive multinomial rollout; deliberately no KV cache for clarity."""
+    if temperature!=1.0:
+        raise ValueError('temperature must be 1.0 to match positions_log_probs')
+    if max_new<1 or not prompt:
+        raise ValueError('Sampling requires a nonempty prompt and max_new >= 1')
     device=next(policy.parameters()).device
     actions=[]
     for _ in range(max_new):
@@ -182,8 +200,14 @@ def extract_expression(code):
     top=tree.body[0]
     if isinstance(top,ast.Expr): return ast.Expression(top.value)
     if (isinstance(top,ast.FunctionDef) and top.name=='solve'
+        and not top.decorator_list and top.returns is None
+        and top.type_comment is None and not getattr(top,'type_params',[])
         and len(top.args.args)==2
         and [p.arg for p in top.args.args]==['a','b']
+        and all(p.annotation is None and p.type_comment is None for p in top.args.args)
+        and not top.args.posonlyargs and not top.args.kwonlyargs
+        and not top.args.defaults and not top.args.kw_defaults
+        and top.args.vararg is None and top.args.kwarg is None
         and len(top.body)==1 and isinstance(top.body[0],ast.Return)):
         return ast.Expression(top.body[0].value)
     raise ValueError('Unrecognized code format')
@@ -252,12 +276,16 @@ def main():
     ap.add_argument('--tokenizer',help='Official local tokenizer.json, decoding only')
     ap.add_argument('--group-size',type=int,default=4)
     args=ap.parse_args()
+    if args.max_new<1:
+        raise ValueError('--max-new must be at least 1')
+    if args.group_size<2:
+        raise ValueError('--group-size must be at least 2 for group-relative advantages')
     torch.manual_seed(args.seed)
     actor,device=initialize(args.tiny,args.checkpoint)
     reference=copy.deepcopy(actor).eval().requires_grad_(False)
     opt=torch.optim.AdamW(actor.parameters(),lr=args.lr)
     if args.data:
-        data=load_jsonl(args.data)
+        data=load_jsonl(args.data,actor.model.embed_tokens.num_embeddings)
     elif args.tiny:
         data=[{'prompt_ids':[1,22,33],
                'tests':[{'a':2,'b':3,'expected':6},{'a':-4,'b':6,'expected':-24}]}]

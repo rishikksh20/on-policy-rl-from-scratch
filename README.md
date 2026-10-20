@@ -169,7 +169,7 @@ Then `r_last += task_score`. The log-prob ratio is a **sampled** KL penalty; it 
 A_t = \delta_t + \gamma\lambda A_{t+1},\qquad R_t=A_t+V_{\mathrm{old}}(s_t)
 \]
 
-`R_t` is the **training target for the critic**. It is computed from observed rewards and earlier critic predictions; it is not a human-authored label. `gae()` uses zero bootstrap when EOS terminates, and predicted end-state value when a rollout is truncated at max length.
+`R_t` is the **training target for the critic**. It is computed from observed rewards and earlier critic predictions; it is not a human-authored label. `gae()` receives zero bootstrap at both EOS and the token limit: each ends the scored-answer task after the outcome reward is assigned.
 
 **4. Calculate PPO losses:**
 
@@ -196,7 +196,7 @@ prompt + previous response tokens
     └── LFMCritic: own pretrained LFM backbone + scalar head → expected future return
 ```
 
-Both backbones load `--checkpoint` into separate trainable parameters. The critic has no vocabulary head, and its scalar value head starts newly initialized. `positions_values` aligns each value with the state **before** the corresponding sampled action. EOS uses zero bootstrap; a token-limit truncation uses the independent critic's value after the final sampled token.
+Both backbones load `--checkpoint` into separate trainable parameters. The critic has no vocabulary head, and its scalar value head starts newly initialized. `positions_values` aligns each value with the state **before** the corresponding sampled action. EOS and the token limit both end this scored-answer task and use zero bootstrap.
 
 Two AdamW optimizers update the actor and critic independently. The actor minimizes `L_actor`; the critic minimizes `c_v * L_critic` (`c_v=0.5`, matching script 01). `--lr` controls the actor and `--critic-lr` controls the critic (default: `--lr`). Rollout advantages and critic targets remain fixed throughout the PPO epochs. The frozen reference model is a separate actor copy used for KL rewards. This uses an additional trainable backbone compared with shared-head PPO.
 
@@ -214,7 +214,7 @@ L_{\mathrm{RM}}=-\log\sigma(r_\psi(x,y^+)-r_\psi(x,y^-))
 
 For example, if `score_chosen=+2.0`, `score_rejected=-1.0`, the loss is `softplus(-3) ≈ 0.0486`. The RM improves when preferred answers receive higher scores. **This is a real learned reward head**; it is deliberately shallow and only trains the last layer because the goal is to show pairwise supervision with a small memory footprint. Full-reward-model training would additionally unfreeze its backbone.
 
-**Step 2 — PPO samples its own completions**. The reward model scores them with `score=tanh(reward_model(prompt,sampled_response))` to keep the example bounded; a production RM calibration would be more careful. This scalar is inserted at the final response token and fed to `gae`, then `ppo_update` runs the exact same actor/critic losses as before. The RM is frozen throughout PPO optimization, so only actor/critic change.
+**Step 2 — PPO samples its own completions**. The reward model scores them with `score=tanh(reward_model(prompt,sampled_response)-score_center)` to keep the example bounded. `score_center` is the fixed mean raw score of labeled chosen/rejected responses after reward-head training, which removes a shared additive score offset. This is centering on training examples, not held-out calibration; reward scale and saturation still need monitoring. This scalar is inserted at the final response token and fed to `gae`, then `ppo_update` runs the exact same actor/critic losses as before. The RM is frozen throughout PPO optimization, so only actor/critic change.
 
 **Do not** train the reward model on its own PPO-generated rewards without independent preference labels; that would create a self-reinforcing score loop.
 
@@ -286,7 +286,7 @@ Then sample G codes, derive GRPO group-relative advantages, and use the **same G
 3. **A small toy dataset will not make pretrained LFM learn general behavior.** Use hundreds/thousands of training problems, held-out evaluation, sensible lengths, and multiple rollouts.
 4. **True sparse rewards are hard**: random completions seldom pass exact-match checks. Add curriculum, stronger SFT initialization, reasonable sample lengths and tasks with solvable outputs, and report success/variance rates.
 5. These examples use **batch=1, no KV cache, serial sampling, FP32 AdamW, no activation checkpointing or adaptive KL controller**. They are intentionally inefficient. Full PPO + reference + RM + critic can require significant VRAM; use appropriately sized devices and reduce lengths if needed.
-6. **Truncation:** PPO bootstraps the critic when generation stops at the token limit. GRPO assigns an outcome score to the truncated completion. For real RLVR, decide explicitly if unfinished code should receive 0.
+6. **Token limits:** PPO and GRPO score the response as finished at EOS or the token limit. PPO therefore uses zero bootstrap for both. A genuinely interrupted continuing task would need different reward timing and a nonzero bootstrap. For real RLVR, decide explicitly if unfinished code should receive 0.
 7. PPO/GRPO objectives here are **pedagogical implementations**, not drop-in reproductions of any particular RL paper's complete hyperparameter choices, credit assignment, loss masking, and distributed sampling.
 
 References: [LFM2.5-230M checkpoint](https://huggingface.co/LiquidAI/LFM2.5-230M), [base](https://huggingface.co/LiquidAI/LFM2.5-230M-Base), [Hugging Face LFM2 architecture implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/lfm2/modeling_lfm2.py).
