@@ -140,6 +140,7 @@
         position: sticky;
         top: 0;
         height: 100vh;
+        min-width: 0;
         border-right: 1px solid var(--line);
         padding: 30px 19px 20px;
         display: flex;
@@ -1099,6 +1100,115 @@
         color: var(--muted);
         margin-top: 12px;
       }
+      .grpo-guide {
+        padding: 18px 22px;
+        border-bottom: 1px solid #ffffff1c;
+        color: #d8e7eb;
+      }
+      .grpo-guide p {
+        font-size: 12px;
+        color: #b1c7cf;
+        margin: 6px 0 12px;
+      }
+      .grpo-guide .button-row {
+        margin-bottom: 14px;
+      }
+      .process .grpo-guide button[aria-pressed="true"] {
+        background: #2d5549;
+        border-color: #92c7a4;
+        color: #e8f5eb;
+      }
+      .grpo-cycle {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        align-items: center;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font: 11px/1.5 var(--mono);
+      }
+      .grpo-cycle li {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: #9fbac5;
+      }
+      .grpo-cycle li + li::before {
+        content: "→";
+        color: #88b0c2;
+      }
+      .grpo-cycle span {
+        border: 1px solid #476373;
+        border-radius: 5px;
+        padding: 5px 8px;
+      }
+      .grpo-cycle [aria-current="step"] span {
+        background: #2d5549;
+        border-color: #92c7a4;
+        color: #e8f5eb;
+      }
+      .grpo-table {
+        margin-top: 14px;
+      }
+      .grpo-table th,
+      .grpo-table td {
+        padding: 9px 8px;
+        border-color: #365260;
+        font-size: 11px;
+        color: #d8e7eb;
+      }
+      .grpo-table th {
+        color: #a5bec7;
+      }
+      .grpo-table caption {
+        text-align: left;
+        font: 11px/1.6 var(--sans);
+        color: #a5bec7;
+        padding-bottom: 8px;
+        white-space: normal;
+      }
+      .world .grpo-positive {
+        color: #ade2bd;
+      }
+      .world .grpo-negative {
+        color: #f0b294;
+      }
+      .grpo-samples {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr));
+        gap: 10px;
+        margin-top: 14px;
+      }
+      .grpo-sample {
+        border: 1px solid #40606d;
+        border-radius: 8px;
+        padding: 12px;
+        background: #203c4a;
+      }
+      .grpo-sample b,
+      .grpo-sample small {
+        display: block;
+        color: #b5c9cd;
+        font: 11px/1.6 var(--mono);
+      }
+      .grpo-sample .token {
+        font: 14px/1.5 var(--mono);
+        margin: 10px 2px;
+      }
+      .grpo-sample strong {
+        display: block;
+        font: 13px/1.6 var(--mono);
+      }
+      .grpo-summary {
+        font: 12px/1.8 var(--mono);
+        color: #d5e8ec;
+        margin-top: 14px;
+        overflow-wrap: anywhere;
+      }
+      .grpo-guide a {
+        color: #b9d3ff;
+      }
       .check {
         margin-top: 20px;
         border: 1px solid var(--line);
@@ -1402,7 +1512,7 @@
       }
       @media (max-width: 850px) {
         .shell {
-          grid-template-columns: 1fr;
+          grid-template-columns: minmax(0, 1fr);
         }
         .sidebar {
           position: sticky;
@@ -1977,45 +2087,69 @@
           mathSub:
             "Click a reward to change an outcome. Try a group where every response has the same score.",
           lab: "group",
-          processTitle: "Watch four attempts teach one actor",
+          processTitle: "Follow a complete GRPO training loop",
           processSub:
-            "The baseline is computed from the group, then discarded after the update.",
+            "Work through 2 + 3 with four sampled answers, real arithmetic at every stage, and a fresh group at the end. Press Play or advance one step at a time.",
           steps: [
             step(
-              "Prompt",
+              "Prepare",
+              "Set up one question and three policy roles",
+              "Use the prompt “What is 2 + 3? Answer only the number.” The trainable actor writes answers. Its rollout-time probabilities become the fixed old-policy cache. A separate reference policy stays frozen throughout training.",
+              "π_old is refreshed for each rollout; π_ref stays the original anchor in 03_grpo.py. There is no value critic.",
+            ),
+            step(
+              "Sample",
               "One question, four independent attempts",
-              "Sample G responses from the same current policy for one prompt. Cache the sampled actions and old log probabilities.",
-              "Different prompts need separate comparison groups.",
+              "Sample four completions from the same actor before any update. Each answer has a number token and EOS. Save both tokens and their old and reference log probabilities. Duplicate answers are valid independent samples.",
+              "The displayed tokens and probabilities are illustrative; they are not actual LFM tokenizer IDs or model outputs.",
             ),
             step(
               "Score",
               "Check every answer",
-              "An exact-token verifier supplies each response’s reward. Here two answers pass and two fail. The scoring stage has no gradient.",
-              "The reward function supplies feedback, not model derivatives.",
+              "Strip the trailing EOS, then compare each sampled answer with the target 5. A matching answer receives 1; any other answer receives 0. These scores come from the verifier, without backpropagation.",
+              "Choose a different example above to see one success, all successes, or all failures flow through the same calculations.",
             ),
             step(
               "Center",
               "Find the average and spread",
-              "Compute the mean and population standard deviation across the group. Centering makes “better than the group” the comparison.",
-              "This replaces a learned value baseline in this example.",
+              "Add the four rewards and divide by four for μ. Compute the average squared distance from μ, then take its square root for σ. This is the population standard deviation, matching unbiased=False in the trainer.",
+              "Only responses to this same prompt belong in this comparison group.",
             ),
             step(
               "Credit",
-              "Give each response relative credit",
-              "Standardize the rewards. Broadcast each response’s scalar advantage to all its generated tokens.",
-              "A correct response can have zero advantage in an all-correct group.",
+              "Turn rewards into token-level learning signals",
+              "Compute Aᵢ = (Rᵢ − μ) / (σ + 10⁻⁶). Assign that same scalar to both the answer token and EOS in response i. Keep these advantages fixed throughout the update epochs.",
+              "Positive advantages encourage sampled tokens; negative ones discourage them. Tied rewards give A = 0, including an all-correct group.",
+            ),
+            step(
+              "Ratio",
+              "Rescore the same tokens with the current actor",
+              "Before the first update, current and old probabilities match, so every ratio is 1. To expose clipping, the next calculations inspect an illustrative later-epoch actor: P(5) = 0.35 and P(4) = 0.15, versus 0.25 for each under the old policy.",
+              "EOS has probability 0.8 after either answer in all three policies, so its ratio stays 1. Rescoring never replaces the cached sampled answers.",
+            ),
+            step(
+              "Clip",
+              "Limit the incentive in either direction",
+              "With ε = 0.2, clamp the ratio to [0.8, 1.2], multiply both ratios by A, and take the smaller result. Then negate it to obtain the policy-loss contribution. The minimum matters especially when A is negative.",
+              "Clipping flattens the outcome incentive beyond the favored boundary; it does not enforce a hard bound on actor probabilities.",
+            ),
+            step(
+              "KL + loss",
+              "Add the reference penalty and average correctly",
+              "For each sampled token, compute d = log π_ref − log πθ and k̂ = exp(d) − d − 1. Add βk̂ with β = 0.02 to the clipped policy loss. Average the two tokens inside each response, then average the four responses.",
+              "This matches grpo_update. On cached old-policy samples, k̂ is a surrogate regularizer, not an exact full-vocabulary KL.",
             ),
             step(
               "Update",
-              "Train the actor with clipping + KL",
-              "Average the clipped per-token objective within each response, then across responses. Add a reference penalty. There is no value regression.",
-              "The frozen reference and the old rollout policy have different roles.",
+              "Backpropagate through the actor only",
+              "Clear gradients, backpropagate the loss through the actor’s current log probabilities, clip the gradient norm, and take an optimizer step. The trainer reuses the fixed group for two update epochs before collecting again.",
+              "Answers, rewards, advantages, old log probabilities, and reference log probabilities stay fixed during these epochs. The numerical later-epoch actor is an illustration, not a simulated optimizer result.",
             ),
             step(
               "Resample",
               "Fresh group, fresh comparison",
-              "Sample again after the update. If every response ties, all outcome advantages are zero; a reference penalty can still contribute.",
-              "Equal rewards remove the outcome learning signal.",
+              "Collect a fresh group with the updated actor and cache its probabilities as the new π_old. Score and normalize this new group from scratch. Below is one possible next group; improvement in a particular sample is not guaranteed.",
+              "The reference stays frozen. Repeat animation replays this worked example; it does not train a model or accumulate improvements.",
             ),
           ],
           question:
@@ -2434,6 +2568,7 @@
         playing = false,
         timer = null,
         scenario = "success",
+        grpoRepeat = true,
         speed = 2600;
       const reduceQuery = matchMedia("(prefers-reduced-motion: reduce)");
       let reduceMotion = reduceQuery.matches;
@@ -2458,6 +2593,12 @@
         layer: 0,
         dataFormat: "numeric",
         prefix: 0,
+      };
+      const grpoExamples = {
+        mixed: { label: "Two correct", rewards: [1, 0, 1, 0] },
+        single: { label: "One correct", rewards: [1, 0, 0, 0] },
+        correct: { label: "All correct", rewards: [1, 1, 1, 1] },
+        wrong: { label: "All wrong", rewards: [0, 0, 0, 0] },
       };
       const learningLabels = {
         p01: ["Policy π", "writes tokens"],
@@ -2895,13 +3036,17 @@
             "actorLoss",
             "reference",
           ],
-          equations: ["sample", "exact", "group", "ratio", "kl", "grpoActor"],
+          equations: ["sample", "exact", "group", "ratio", "surrogate", "kl", "grpoActor"],
           stages: [
+            ["sample"],
             ["sample"],
             ["exact"],
             ["group"],
             ["group"],
-            ["ratio", "kl", "grpoActor"],
+            ["ratio"],
+            ["surrogate"],
+            ["kl", "grpoActor"],
+            ["grpoActor"],
             ["refresh"],
           ],
         },
@@ -3030,6 +3175,23 @@
           .join("")}</div></div>`;
       }
       function replayWorkedValues(key) {
+        if (current === "p03") {
+          const e = grpoWorkedExample(), first = e.rows[0];
+          if (key === "exact")
+            return `Compare each answer with 5 → R = [${e.values.join(", ")}]. EOS is removed only for verification; it remains a sampled action in the loss.`;
+          if (key === "group")
+            return `R = [${e.values.join(", ")}] → μ = ${fixed(e.mean, 3)}, σ = ${fixed(e.std, 3)}, A = [${e.advantages.map((a) => signed(a, 3)).join(", ")}]. Both tokens in response i receive Aᵢ.`;
+          if (key === "ratio")
+            return "At collection: ρ = 1. Later-epoch illustration: ρ(5) = 0.35 / 0.25 = 1.4; ρ(4) = 0.15 / 0.25 = 0.6. EOS: 0.8 / 0.8 = 1. Old probabilities stay fixed.";
+          if (key === "surrogate")
+            return `Response 1, answer token: min(${signed(first.ratio * first.advantage, 3)}, ${signed(first.clippedRatio * first.advantage, 3)}) = ${signed(first.surrogate, 3)}. Its EOS contributes J = ${signed(first.advantage, 3)}. Negate J for the policy loss.`;
+          if (key === "kl")
+            return `Response 1, answer token: d = log(0.25 / ${first.current}) = ${signed(first.d, 5)}, k̂ = ${fixed(first.kl, 5)}. EOS has d = 0 and k̂ = 0. β = ${e.beta}.`;
+          if (key === "grpoActor")
+            return `Group mean policy loss = ${signed(e.policyLoss, 6)}; mean sampled penalty = ${fixed(e.meanKL, 6)}. L_actor = ${signed(e.policyLoss, 6)} + ${e.beta} × ${fixed(e.meanKL, 6)} = ${signed(e.loss, 6)}. Token means precede the group mean.`;
+          if (key === "refresh")
+            return "One possible fresh group: R = [1, 1, 0, 1], μ = 0.75, σ ≈ 0.433, A ≈ [+0.577, +0.577, −1.732, +0.577]. Recompute the old-policy cache; keep the reference frozen.";
+        }
         const isPPO = ["p01", "p02", "p05"].includes(current);
         if (isPPO) {
           const R =
@@ -3128,6 +3290,15 @@
             '<option value="success">Correct answer</option><option value="failure">Wrong answer</option>';
           control.value = scenario;
           $(".process-toolbar .button-row").prepend(control);
+        }
+        if (current === "p03") {
+          $(".process-toolbar .button-row").insertAdjacentHTML(
+            "beforeend",
+            `<button class="btn secondary" data-action="grpo-repeat" aria-pressed="${grpoRepeat}">↻ Repeat animation: ${grpoRepeat ? "on" : "off"}</button>`,
+          );
+          $(".process-rail").insertAdjacentHTML("beforebegin", grpoGuideMarkup());
+          $(".process-foot").textContent =
+            "The answer tokens, later-epoch probabilities, and next group are illustrative. All displayed advantages and losses are calculated from them using the trainer’s equations. Repeat replays the same example. Use Next for manual steps, or change the rewards above to inspect ties.";
         }
         $("#speed").value = String(speed);
         updateLab();
@@ -3434,6 +3605,66 @@
           )
           .join("");
       }
+      function grpoGuideMarkup() {
+        return `<div class="grpo-guide"><h3>Worked task: What is 2 + 3?</h3><p>G = 4 · target = 5 · ε = 0.2 · β = 0.02. Each response contains a number token and EOS. Choose a group; every calculation below updates with it.</p><div class="button-row" role="group" aria-label="GRPO worked example">${Object.entries(grpoExamples).map(([key, example]) => `<button class="btn secondary" data-grpo-example="${key}" aria-pressed="false">${example.label}</button>`).join("")}</div><ol class="grpo-cycle" aria-label="GRPO training cycle">${["Sample", "Score", "Normalize", "Loss", "Update", "Resample ↻"].map((label, i) => `<li data-grpo-phase="${i}"><span>${label}</span></li>`).join("")}</ol><p>Equations follow <a href="03_grpo.py">03_grpo.py</a>. Background: <a href="https://arxiv.org/html/2402.03300v3#S4.SS1" target="_blank" rel="noreferrer">DeepSeekMath §4.1 ↗</a>.</p></div>`;
+      }
+      function grpoWorkedExample(values = state.rewards) {
+        const g = groupStats(values), beta = 0.02, clip = 0.2;
+        const rows = values.map((reward, i) => {
+          const answer = reward ? "5" : "4",
+            current = reward ? 0.35 : 0.15,
+            advantage = g.advantages[i],
+            ratio = current / 0.25,
+            clippedRatio = clamp(ratio, 1 - clip, 1 + clip),
+            surrogate = clipValue(ratio, advantage, clip),
+            d = Math.log(0.25 / current),
+            kl = Math.exp(d) - d - 1,
+            // EOS has the same probability (0.8) under all three policies:
+            // its ratio is 1, its surrogate is A_i, and its KL term is 0.
+            policyLoss = -(surrogate + advantage) / 2,
+            meanKL = kl / 2;
+          return { answer, reward, advantage, current, ratio, clippedRatio,
+            surrogate, d, kl, policyLoss, meanKL, loss: policyLoss + beta * meanKL };
+        });
+        const mean = (key) => rows.reduce((sum, row) => sum + row[key], 0) / rows.length;
+        return { ...g, values, rows, beta, clip,
+          policyLoss: mean("policyLoss"), meanKL: mean("meanKL"), loss: mean("loss") };
+      }
+      function grpoTable(caption, columns, rows) {
+        return `<div class="table-scroll grpo-table" tabindex="0" role="region" aria-label="${esc(caption)}"><table><caption>${esc(caption)}</caption><thead><tr>${columns.map((column) => `<th scope="col">${esc(column)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell, i) => i ? `<td>${esc(cell)}</td>` : `<th scope="row">${esc(cell)}</th>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+      }
+      function grpoSamples(e, { scores = false, advantages = false } = {}) {
+        return `<div class="grpo-samples">${e.rows.map((row, i) => `<div class="grpo-sample"><b>Response ${i + 1}</b>${[row.answer, "EOS"].map((token, t) => `<span class="token ${advantages ? "credit" : "action"}" style="animation-delay:${reduceMotion ? 0 : i * 0.16 + t * 0.12}s">${token}</span>`).join("")}${scores ? `<small>reward = ${row.reward} ${row.reward ? "✓" : "✕"}</small>` : ""}${advantages ? `<strong class="${row.advantage < 0 ? "grpo-negative" : "grpo-positive"}">A = ${signed(row.advantage, 3)}</strong><small>number: ${signed(row.advantage, 3)}<br>EOS: ${signed(row.advantage, 3)}</small>` : ""}</div>`).join("")}</div>`;
+      }
+      function grpoScene(f) {
+        const e = grpoWorkedExample(),
+          list = e.values.join(" + "),
+          prompt = '<div class="prompt">What is 2 + 3? Answer only the number.<br>Verifier target: 5 · group size: 4</div>';
+        if (f === 0)
+          return `${prompt}<div class="node-row">${node("Actor πθ", "trainable; generates tokens", "lit")}${node("Old policy π_old", "rollout-time probability cache", "frozen")}${node("Reference π_ref", "fixed initial actor copy", "frozen")}</div><div class="mini-equation">Start: πθ = π_old = π_ref.<br>After updates: πθ changes. Refresh π_old at the next rollout; keep π_ref fixed.</div>`;
+        if (f === 1)
+          return `${prompt}${grpoSamples(e)}<div class="mini-equation">Cache actions + old_logp + ref_logp.<br>Example old probabilities: P(number) = 0.25; P(EOS | number) = 0.80.<br>Cache their logs: [${fixed(Math.log(0.25), 4)}, ${fixed(Math.log(0.8), 4)}] per response.</div>`;
+        if (f === 2)
+          return `${prompt}${grpoTable("Exact-match verification after removing one trailing EOS", ["Response", "Sampled tokens", "Compare with 5", "Reward Rᵢ"], e.rows.map((r, i) => [i + 1, r.answer + " EOS", r.answer + (r.reward ? " = 5 ✓" : " ≠ 5 ✕"), r.reward]))}<div class="grpo-summary">R = [${e.values.join(", ")}]</div>`;
+        if (f === 3)
+          return `${prompt}<div class="mini-equation">μ = (${list}) / 4 = ${fixed(e.mean, 4)}<br>σ² = [${e.values.map((r) => `(${r} − ${fixed(e.mean, 2)})²`).join(" + ")}] / 4<br>σ² = ${fixed(e.std ** 2, 4)}<br>σ = √${fixed(e.std ** 2, 4)} = ${fixed(e.std, 4)}</div><div class="metrics">${metric(fixed(e.mean, 3), "Group mean μ")}${metric(fixed(e.std, 3), "Population spread σ")}</div><p class="small" style="margin-top:14px">Divide the variance by G = 4, matching torch.std(unbiased=False).</p>`;
+        if (f === 4)
+          return `${grpoSamples(e, { scores: true, advantages: true })}<div class="mini-equation">A₁ = (${e.values[0]} − ${fixed(e.mean, 3)}) / (${fixed(e.std, 3)} + 0.000001) ≈ ${signed(e.advantages[0], 3)}<br>A = [${e.advantages.map((a) => signed(a, 3)).join(", ")}]<br>${e.std === 0 ? "All rewards tie → every A is exactly 0. Only reference regularization can contribute to the actor loss." : "One scalar per response, broadcast to every generated token, including EOS."}</div>`;
+        if (f === 5)
+          return grpoTable("Illustrative later-epoch probabilities for the first answer token", ["Response", "Token", "π_old", "πθ", "π_ref", "ρ = πθ / π_old"], e.rows.map((r, i) => [i + 1, r.answer, "0.25", fixed(r.current), "0.25", fixed(r.ratio)])) +
+            `<div class="mini-equation">At the first update, all ρ = 1.<br>Here we inspect a later-epoch example to make clipping visible.<br>EOS: π_old = πθ = π_ref = 0.80 → ρ = 1.</div><p class="small" style="margin-top:14px">Toy number-token distribution: old/reference [5: .25, 4: .25, 6: .25, 7: .25]; illustrative current actor [5: .35, 4: .15, 6: .25, 7: .25]. These are chosen probabilities, not the result of a simulated gradient step.</p>`;
+        if (f === 6)
+          return grpoTable("First answer token: J = min(ρA, clip(ρ)A), policy loss = −J", ["Response", "Aᵢ", "ρ", "ρA", "clip(ρ)A", "J", "−J"], e.rows.map((r, i) => [i + 1, signed(r.advantage, 3), fixed(r.ratio), signed(r.ratio * r.advantage, 3), signed(r.clippedRatio * r.advantage, 3), signed(r.surrogate, 3), signed(-r.surrogate, 3)])) +
+            `<div class="mini-equation">Clip range: [0.8, 1.2].<br>For A ≈ +1: min(1.4, 1.2) = 1.2.<br>For A ≈ −1: min(−0.6, −0.8) = −0.8.<br>EOS: ρ = 1 → J = Aᵢ → policy loss = −Aᵢ.</div><p class="small" style="margin-top:14px">${e.std === 0 ? "In this tied group A = 0, so every outcome-policy entry above is 0. The ±1 examples explain the mixed-group case." : "Use the smaller signed value, including for a negative advantage. The displayed A values include the 10⁻⁶ stabilizer."}</p>`;
+        if (f === 7)
+          return `<div class="mini-equation">Response 1, number token:<br>d = log(0.25 / ${fixed(e.rows[0].current)}) = ${signed(e.rows[0].d, 5)}<br>k̂ = exp(d) − d − 1 = ${fixed(e.rows[0].kl, 5)}<br>EOS: k̂ = 0. β = 0.02.</div>` +
+            grpoTable("Mean the number token and EOS first; then mean the four responses", ["Response", "meanₜ(−J)", "meanₜ(k̂)", "Lᵢ = policy + βk̂"], e.rows.map((r, i) => [i + 1, signed(r.policyLoss, 5), fixed(r.meanKL, 5), signed(r.loss, 5)])) +
+            `<div class="grpo-summary">L_actor = ${signed(e.policyLoss, 6)} + 0.02 × ${fixed(e.meanKL, 6)}<br>= <strong>${signed(e.loss, 6)}</strong></div><p class="small" style="margin-top:14px">${e.std === 0 ? "Tied group: the policy term is zero. The illustrative current actor differs from the reference, so a positive regularization term remains." : "The negative sign on J is deliberate: the optimizer minimizes this loss."}</p>`;
+        if (f === 8)
+          return `<div class="node-row">${node("Current actor log πθ", "carries gradients", "lit")}${arrow}${node("L_actor", signed(e.loss, 6), "lit")}${arrow}${node("Actor optimizer", "updates θ only", "lit")}</div><div class="node-row">${node("Actions + advantages", "fixed for both epochs", "frozen")}${node("Old + reference logp", "cached, detached tensors", "frozen")}</div><div class="mini-equation">optimizer.zero_grad(set_to_none=True)<br>loss.backward()<br>clip_grad_norm_(actor.parameters(), 1.0)<br>optimizer.step()<br>Repeat for the next epoch on this same group.</div><p class="small" style="margin-top:14px">At the initial actor, the group’s policy loss can be 0 while its gradient is nonzero. A scalar loss of 0 alone does not imply no learning signal.</p>`;
+        const next = grpoWorkedExample([1, 1, 0, 1]);
+        return `<div class="prompt">One possible next group for the same prompt<br>New samples; recompute rewards, μ, σ, and A.</div>${grpoSamples(next, { scores: true, advantages: true })}<div class="mini-equation">New μ = ${fixed(next.mean, 3)} · new σ = ${fixed(next.std, 3)}<br>New A = [${next.advantages.map((a) => signed(a, 3)).join(", ")}]<br>π_old ← updated actor at collection; π_ref stays frozen.</div><div class="node-row">${node("↻ Return to sampling", "new group, fresh learning signal", "lit")}${arrow}${node("Score → normalize", "repeat the training loop")}</div><p class="small" style="margin-top:14px">This possible sample is not a promised improvement. Animation repeat returns to the original worked example.</p>`;
+      }
       function groupWorld(
         values,
         { showScore = false, showAdv = false, codes = null } = {},
@@ -3482,32 +3713,7 @@
           return worlds[f];
         }
         if (current === "p03") {
-          const values = state.rewards,
-            codes = values.map((r, i) => (r ? "5" : i % 2 ? "4" : "6")),
-            g = groupStats(values);
-          if (f === 0)
-            return (
-              `<div class="prompt">Same prompt: What is 2 + 3?</div>` +
-              groupWorld(values, { codes })
-            );
-          if (f === 1) return groupWorld(values, { codes, showScore: true });
-          if (f === 2)
-            return (
-              groupWorld(values, { showScore: true }) +
-              `<div class="metrics">${metric(fixed(g.mean), "Group mean μ")}${metric(fixed(g.std), "Population spread σ")}</div>`
-            );
-          if (f === 3)
-            return groupWorld(values, { showScore: true, showAdv: true });
-          if (f === 4)
-            return (
-              bars(
-                ["Response 1", "Response 2", "Response 3", "Response 4"],
-                g.advantages,
-                { isSigned: true, max: 2, dark: true },
-              ) +
-              `<div class="node-row">${node("Actor update", "clip + reference penalty", "lit")}${node("Critic", "none")}</div>`
-            );
-          return `<div class="node-row">${node("Updated actor", "sample a fresh group", "lit")}${arrow}${node("New comparison", "new rewards, μ and σ")}${node("Reference", "stays frozen", "frozen")}</div><div class="mini-equation">${g.std < 1e-10 ? "Current group: zero outcome advantages." : "Current group: relative outcome signal available."}</div>`;
+          return grpoScene(f);
         }
         if (current === "p04") {
           const programs = ["a+b", "a-b", "a*b", "a"],
@@ -3611,6 +3817,18 @@
           ((frame + 1) / l.steps.length) * 100 + "%";
         $('[data-action="back"]').disabled = frame === 0;
         $('[data-action="next"]').disabled = frame === l.steps.length - 1;
+        if (current === "p03") {
+          const phase = [0, 0, 1, 2, 2, 3, 3, 3, 4, 5][frame];
+          $$("[data-grpo-phase]").forEach((item) => {
+            if (+item.dataset.grpoPhase === phase)
+              item.setAttribute("aria-current", "step");
+            else item.removeAttribute("aria-current");
+          });
+          $$("[data-grpo-example]").forEach((button) => {
+            const rewards = grpoExamples[button.dataset.grpoExample].rewards;
+            button.setAttribute("aria-pressed", String(rewards.every((r, i) => r === state.rewards[i])));
+          });
+        }
         syncPlay();
       }
       function syncPlay() {
@@ -3623,7 +3841,7 @@
             : "▶ Play";
         b.setAttribute("aria-pressed", String(playing));
         $("#play-status").textContent = playing
-          ? "Playing"
+          ? current === "p03" && grpoRepeat ? "Playing · repeats after step 10" : "Playing"
           : frame === lessons[current].steps.length - 1
             ? "Complete · replay or explore"
             : "Paused · explore at your pace";
@@ -3637,11 +3855,12 @@
       function tick() {
         if (!playing) return;
         timer = setTimeout(() => {
-          if (frame < lessons[current].steps.length - 1) {
-            frame++;
-            renderFrame();
-          }
-          if (frame === lessons[current].steps.length - 1) pause();
+          timer = null;
+          const last = lessons[current].steps.length - 1,
+            repeat = current === "p03" && grpoRepeat;
+          frame = frame === last && repeat ? 0 : Math.min(last, frame + 1);
+          renderFrame();
+          if (frame === last && !repeat) pause();
           else tick();
         }, speed);
       }
@@ -3690,6 +3909,13 @@
         }
         if (b.hasAttribute("data-motion")) {
           setMotion(!reduceMotion);
+          return;
+        }
+        if (b.hasAttribute("data-grpo-example")) {
+          pause();
+          state.rewards = [...grpoExamples[b.dataset.grpoExample].rewards];
+          updateLab();
+          renderFrame(false);
           return;
         }
         if (b.dataset.term) {
@@ -3744,6 +3970,13 @@
         const action = b.dataset.action;
         if (!action) return;
         if (action === "play") play();
+        else if (action === "grpo-repeat") {
+          grpoRepeat = !grpoRepeat;
+          b.textContent = `↻ Repeat animation: ${grpoRepeat ? "on" : "off"}`;
+          b.setAttribute("aria-pressed", String(grpoRepeat));
+          if (!grpoRepeat && frame === lessons[current].steps.length - 1) pause();
+          else syncPlay();
+        }
         else if (action === "back") {
           pause();
           frame = Math.max(0, frame - 1);
