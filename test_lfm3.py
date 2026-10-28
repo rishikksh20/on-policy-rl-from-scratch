@@ -909,8 +909,7 @@ def run_unit_tests():
     torch.set_num_threads(1)
     try:
         suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-        with contextlib.redirect_stdout(sys.stderr):
-            result = unittest.TextTestRunner(verbosity=2).run(suite)
+        result = unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)
         return result.wasSuccessful()
     finally:
         torch.set_num_threads(previous_threads)
