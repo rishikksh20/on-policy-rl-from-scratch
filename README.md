@@ -15,9 +15,16 @@ Six `.py` trainers using shared model code in `lfm.py`, no TRL, veRL, Hugging Fa
 | `05_ppo_independent_critic.py` | Exact-match PPO with an independent critic | Separate pretrained LFM actor and critic backbones, deterministic verifier |
 | `06_grpo_preference_reward.py` | Group-relative RL from subjective preferences | LFM actor + trained, frozen preference reward model; **no critic** |
 | `lfm.py` | Shared model implementation | LFM architecture, policy/value heads, configuration, checkpoint loading, model initialization |
+| `lfm3.py` | Separate pure PyTorch LFM3-1.7B implementation | Same policy/critic interfaces, gated full/sliding attention, width-7 convolutions, local checkpoint loading |
+| `lfm3.md` | LFM3 architecture reference | Exact supplied config, partial RoPE layout, sandwich norms, checkpoint tensors, usage, and implementation limits |
+| `test_lfm3.py` | Combined LFM3 tests and real-model generation | Grouped offline tests, verified downloads, tokenizer, and local PyTorch generation without Hugging Face runtime libraries |
 | `prepare_data_optional.py` | Turn human-readable prompts into model token IDs | This **one-time optional** step uses the official Transformers tokenizer; trainers don't depend on it |
 
 All six trainers import their model implementation from `lfm.py`; keep it alongside the scripts. Dataset loading, sampling, rewards, and RL losses stay in the trainers.
+
+For the separate LFM3 implementation, see [`lfm3.md`](lfm3.md) and run `python test_lfm3.py --unit` for offline architecture, equation, gradient, and checkpoint checks. Its interfaces follow `lfm.py`; adapting an existing trainer also requires LFM3 tokenized data and special-token IDs.
+
+Run the real LFM3 chat example with `pip install torch regex jinja2` followed by `python test_lfm3.py`. It runs the offline tests first, then downloads about 3.46 GB of weights into `checkpoints/LFM3-1.7B/`, verifies checksums, and generates an answer to “What is C. elegans?”. Use `--offline` to reuse local files, `--prompt` to change the question, or `--max-new-tokens` for a shorter run. Sampling defaults are grouped in `SAMPLING` at the top of the file; device and dtype are selected automatically. Results are saved to `checkpoints/LFM3-1.7B/generation_result.json`. The model stays pure PyTorch; `regex` and Jinja2 handle the downloaded tokenizer pattern and chat template in the test script.
 
 ## 2. Requirements and run commands
 

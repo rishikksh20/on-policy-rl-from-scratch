@@ -1,16 +1,3 @@
-# Copyright 2026 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """LFM3-1.7B architecture and checkpoint loading in pure PyTorch.
 
 Adapted from the supplied official LFM3 reference, using lfm.py's interfaces.
@@ -262,6 +249,8 @@ def _attention_masks(c, length, device, padding_mask=None, seq_idx=None):
     """Build masks once per forward; SDPA Boolean True means the key is allowed."""
     kinds = set(c['layers']) & set(ATTENTION_TYPES)
     masks = {}
+    if not kinds:
+        return masks
     plain = padding_mask is None and seq_idx is None
     if plain and ('sliding_attention' not in kinds or length <= c['sliding_window']):
         return dict.fromkeys(kinds)  # SDPA's causal flag handles every layer

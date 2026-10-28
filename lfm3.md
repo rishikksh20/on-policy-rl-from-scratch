@@ -231,7 +231,7 @@ The supplied reference supports a hybrid cache: full-attention KV history grows 
 
 In the reference, packed documents must be prefilled in one forward into an empty cache. Their cache cannot subsequently be continued because attention would span documents; packed generation is rejected before prefill. Static-cache masks also impose restrictions on packed prefill and position-only padding. Full and sliding masks must be sized from a layer of their own type rather than the leading convolution layer. The local full-prefix implementation needs no cache sizing logic.
 
-**Like `lfm.py`, `lfm3.py` implements training and full-prefix forwards without an inference cache.** `use_cache=true` in the original config describes the official implementation, not an enabled local cache. Sampling can recompute each prefix. There is no local `generate`, tokenizer, chat template, Transformers remote-code loading, Triton dependency, static cache, attention-backend registry, tensor-parallel plan, or framework gradient-checkpointing wrapper. These are integration/optimization features, not additional learned components. Adding caching later must preserve both attention histories and the convolution state.
+**Like `lfm.py`, `lfm3.py` implements training and full-prefix forwards without an inference cache.** `use_cache=true` in the original config describes the official implementation, not an enabled local cache. Sampling can recompute each prefix. The model module has no `generate`, tokenizer, or chat-template dependency; the separate `test_lfm3.py` script provides those inference helpers. There is no Transformers remote-code loading, Triton dependency, static cache, attention-backend registry, tensor-parallel plan, or framework gradient-checkpointing wrapper. These are integration/optimization features, not additional learned components. Adding caching later must preserve both attention histories and the convolution state.
 
 The six existing RL trainers still import `lfm.py` and retain LFM2.5-specific EOS/vocabulary assumptions. Importing `lfm3` in a new caller provides the same basic model interfaces, but switching a trainer to the real LFM3 also requires LFM3 tokenization, special-token IDs, and suitable data. LFM2.5 checkpoints and token IDs are not interchangeable with this model.
 
@@ -243,4 +243,56 @@ The simple sliding mask here is a dense `[time, time]` Boolean tensor, so it doe
 
 If a cache were added, the six full-attention layers alone would use 12,288 bytes of BF16 KV storage per token per batch row (two tensors × six layers × four KV heads × 128 dimensions × two bytes), or 3 GiB at the configured maximum context. This excludes sliding and convolution states.
 
-Run `python tests_lfm3.py` for focused offline checks of the exact architecture count and tensor layout, partial RoPE, reference-style eager attention and convolution equations, sliding-window boundaries, sandwich residuals, causality, padding/packing isolation, gradients, tied heads, and synthetic single/sharded checkpoint loading. Run `python tests_smoke.py` for the existing LFM2.5/RL regression checks. These tests do not establish numerical parity with the real pretrained checkpoint or measure model quality; that requires the actual checkpoint and an official-runtime comparison.
+Run `python test_lfm3.py --unit` for focused offline checks of the exact architecture count and tensor layout, partial RoPE, reference-style eager attention and convolution equations, sliding-window boundaries, sandwich residuals, causality, padding/packing isolation, gradients, tied heads, and synthetic single/sharded checkpoint loading. Run `python tests_smoke.py` for the existing LFM2.5/RL regression checks. These offline tests do not establish numerical parity with the real pretrained checkpoint or measure model quality; that requires the actual checkpoint and an official-runtime comparison.
+
+Both suites passed locally on CPU with PyTorch 2.8.0. An additional comparison executed the computational classes extracted from the supplied official source, replacing framework decorators/dispatch only, and loaded matching small random weights by exact tensor name. Across normal, padded, and packed inputs, with convolution bias and sandwich norms each enabled/disabled, FP32 outputs differed by less than `1e-5`; gradients also matched within the comparison tolerances. BF16 forward/backward checks passed, with the expected larger rounding differences between PyTorch SDPA and the reference's eager softmax.
+
+## Real checkpoint generation test
+
+[`test_lfm3.py`](test_lfm3.py) combines the offline suite and the supplied `LiquidAI/LFM3-1.7B` pipeline example in one file. Its code is grouped into configuration, downloads, tokenization, generation, test helpers, test cases, and the entry point. Test classes group architecture, positions/masks, model gradients, checkpoints, generation, and runner behavior. The default command runs the quick checks first and proceeds to real generation only if they pass.
+
+The hosted release's architecture was checked against the supplied config. The script imports no `transformers`, `huggingface_hub`, `tokenizers`, or `safetensors` package. It uses stdlib HTTP for downloads, a local ByteLevel BPE implementation for `tokenizer.json`, the independent `regex` package for the tokenizer's Unicode pretokenization pattern, and Jinja2's sandbox to render the downloaded official chat template. `lfm3.py` and the offline test mode require only PyTorch and stdlib.
+
+```bash
+pip install torch regex jinja2
+
+# Quick offline tests only (no tokenizer dependencies or checkpoint needed):
+python test_lfm3.py --unit
+
+# Run checks, then download, verify, load, and generate:
+python test_lfm3.py
+
+# Same run without any network access after the files have been downloaded:
+python test_lfm3.py --offline
+
+# Shorter run; thinking may consume the whole limit before an answer appears:
+python test_lfm3.py --offline --max-new-tokens 64
+
+# Optional different prompt:
+python test_lfm3.py --offline --prompt "Explain grouped-query attention."
+```
+
+The CLI has four options: `--unit`, `--offline`, `--prompt`, and `--max-new-tokens`. Advanced sampling settings live together in the `SAMPLING` dictionary at the top of the file, alongside `MODEL_ID`, `DEFAULT_DIRECTORY`, and `PROMPT`. The device and storage dtype are automatic: CUDA with BF16 when CUDA is available, otherwise CPU with FP32. Results always go into the checkpoint directory. The normal generation path retains the official thinking-enabled template.
+
+The defaults are `do_sample=True`, temperature `0.1`, top-k `50`, repetition penalty `1.1`, maximum **2,048 new tokens**, and local random seed `42`. The penalty is applied once per distinct token in the entire prompt/generated history, multiplying negative logits and dividing positive logits, followed by temperature scaling, top-k filtering, and multinomial sampling. Generation stops on the downloaded generation config's EOS IDs. A sampled answer need not be identical to a separate pipeline run, particularly when seeds, attention backends, dtypes, or caching differ.
+
+The official template defaults to thinking enabled, so the exact initial prompt is:
+
+```text
+<|startoftext|><|im_start|>user
+What is C. elegans?<|im_end|>
+<|im_start|>assistant
+<think>
+```
+
+For the tested revision, its 17 token IDs are `[124894, 124899, 5922, 207, 2992, 355, 340, 22, 13729, 497, 39, 124900, 207, 124899, 63514, 207, 124901]`. The tokenizer implements the checkpoint's `ignore_merges=true` behavior, added tokens, byte alphabet, merge ranks, and UTF-8 decoding. Its encoding/decoding matched the reference tokenizer on 111 validation inputs, including both thinking-enabled and thinking-disabled chat prompts, Unicode, whitespace, and random strings. The reference package was used only as a development oracle, not by the delivered test script.
+
+Downloads are pinned to one commit per run and checked against the repository's LFS SHA-256 or Git blob hash. Completed files are reused after verification; interrupted weight downloads resume from `.part` files. The script supports the single checkpoint file in this release and sharded indexes if the repository supplies one. The default directory `checkpoints/LFM3-1.7B/` is ignored by Git and includes the model license. `--offline` verifies the recorded local files without contacting the server.
+
+The real run on **2026-10-28** loaded **286 checkpoint tensors**, verified all **1,728,801,536 unique parameters** and tied embeddings, and generated **819 new tokens in approximately 53.7 seconds on CUDA with BF16 weights**, ending on EOS before the configured 2,048-token limit. It used revision **`40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd`**; every generated step had finite logits. The generated answer discusses the nematode and its use as a model organism. This verifies end-to-end local inference; generated factual claims are not a model-quality benchmark.
+
+An additional pretrained comparison used the pasted official computational classes with the same checkpoint tensors. Last-position logits matched **exactly** with the same PyTorch SDPA implementation and mask conventions at prefix lengths **17, 49, and 273**, including a prefix longer than the sliding window. The official eager-attention path showed BF16 rounding differences (maximum absolute logit differences 0.1875–0.375) but selected the same highest-scoring next token at all three prefixes. These comparison records are included under `reference_checks` in the saved result from this run.
+
+The complete result is saved to `checkpoints/LFM3-1.7B/generation_result.json`: prompt and generated IDs, raw decoded continuation, separately parsed `reasoning_content` and `assistant_content`, sampling settings, revision, runtime, stop reason, and verification flags. Standard output shows the assistant answer; tests and progress go to standard error. If a short token limit ends during thinking, the JSON preserves the partial reasoning and records an empty final answer. The generation loop computes the LM head only for the last position and recomputes the backbone prefix on each step.
+
+`python test_lfm3.py --unit` runs 19 offline tests, including generation's sampling order, EOS/length stopping, inference without gradients, download resumption/checksums, offline reuse, reasoning/content separation, and CLI routing. `python -m unittest test_lfm3` also discovers the tests. Importing `test_lfm3.py` does not run tests, download files, or start generation.
