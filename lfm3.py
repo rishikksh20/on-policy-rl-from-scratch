@@ -2,7 +2,7 @@
 
 Adapted from the supplied official LFM3 reference, using lfm.py's interfaces.
 Requires only torch + Python stdlib. See lfm3.md for architecture nuances.
-Full-prefix training/forwards only: no KV/conv cache or tokenizer dependency.
+Full-prefix training plus cached prefill/decode; no tokenizer dependency.
 """
 import json
 import math
@@ -89,7 +89,22 @@ class SwiGLU(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-def rotary(q, k, theta, partial_rotary_factor=1.0, position_ids=None):
+def _rotary_inv_freq(hd, theta, partial_rotary_factor, device):
+    angles = int(partial_rotary_factor * hd) // 2
+    inv = 1.0 / (theta ** (torch.arange(0, 2 * angles, 2, device=device,
+                                      dtype=torch.float32) / hd))
+    return F.pad(inv, (0, hd // 2 - angles))
+
+
+def _rotary_embeddings(inv, position_ids, dtype):
+    a = position_ids.float()[..., None] * inv
+    a = torch.cat([a, a], dim=-1)
+    return (a.cos().to(dtype).float().unsqueeze(1),
+            a.sin().to(dtype).float().unsqueeze(1))
+
+
+def rotary(q, k, theta, partial_rotary_factor=1.0, position_ids=None,
+           position_embeddings=None):
     """Split-half RoPE on [B,H,T,A], preserving full-head frequency spacing.
 
     Partial rotation zeroes the tail of A/2 frequencies, then duplicates the
@@ -100,14 +115,10 @@ def rotary(q, k, theta, partial_rotary_factor=1.0, position_ids=None):
     t, hd = q.shape[-2:]
     if position_ids is None:
         position_ids = torch.arange(t, device=q.device).unsqueeze(0)
-    angles = int(partial_rotary_factor * hd) // 2
-    inv = 1.0 / (theta ** (torch.arange(0, 2 * angles, 2, device=q.device,
-                                      dtype=torch.float32) / hd))
-    inv = F.pad(inv, (0, hd // 2 - angles))
-    a = position_ids.to(device=q.device, dtype=torch.float32)[..., None] * inv
-    a = torch.cat([a, a], dim=-1)
-    co = a.cos().to(q.dtype).float().unsqueeze(1)
-    si = a.sin().to(q.dtype).float().unsqueeze(1)
+    if position_embeddings is None:
+        inv = _rotary_inv_freq(hd, theta, partial_rotary_factor, q.device)
+        position_embeddings = _rotary_embeddings(inv, position_ids.to(q.device), q.dtype)
+    co, si = position_embeddings
 
     def rot(x):
         xf = x.float()
@@ -131,21 +142,32 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.hd, c['norm_eps'])
         self.gate_proj = nn.Linear(d, self.h, bias=False)
 
-    def forward(self, x, position_ids=None, attention_mask=None):
+    def forward(self, x, position_ids=None, attention_mask=None, *,
+                position_embeddings=None, cache=None, layer_idx=None):
         b, t, _ = x.shape
         q = self.q_norm(self.q_proj(x).reshape(b, t, self.h, self.hd)).transpose(1, 2)
         k = self.k_norm(self.k_proj(x).reshape(b, t, self.kh, self.hd)).transpose(1, 2)
         v = self.v_proj(x).reshape(b, t, self.kh, self.hd).transpose(1, 2)
         q, k = rotary(q, k, self.rope['rope_theta'],
-                      self.rope.get('partial_rotary_factor', 1.0), position_ids)
-        k = k.repeat_interleave(self.h // self.kh, dim=1)
-        v = v.repeat_interleave(self.h // self.kh, dim=1)
+                      self.rope.get('partial_rotary_factor', 1.0), position_ids,
+                      position_embeddings)
+        if cache is not None:
+            k, v = cache.update_attention(layer_idx, k, v)
+        # CUDA's single-query SDPA path can consume grouped KV heads directly.
+        gqa = cache is not None and t == 1 and x.is_cuda
+        if not gqa:
+            k = k.repeat_interleave(self.h // self.kh, dim=1)
+            v = v.repeat_interleave(self.h // self.kh, dim=1)
         if attention_mask is None and self.sliding_window is not None and t > self.sliding_window:
             pos = torch.arange(t, device=x.device)
             distance = pos[:, None] - pos[None, :]
             attention_mask = (distance >= 0) & (distance < self.sliding_window)
+        # A cached single query attends to every stored key. SDPA's causal flag
+        # aligns non-square matrices at the top left and would mask past keys.
+        causal = attention_mask is None and not (cache is not None and cache.start > 0)
+        options = dict(enable_gqa=True) if gqa else {}
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask,
-                                            is_causal=attention_mask is None, dropout_p=0.0)
+                                            is_causal=causal, dropout_p=0.0, **options)
         out = out.transpose(1, 2)  # [B,T,H,A]; one sigmoid gate per query head
         gate = torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)
         return self.o_proj((out * gate).reshape(b, t, self.h * self.hd))
@@ -160,14 +182,18 @@ class ShortConv(nn.Module):
         self.conv = nn.Conv1d(d, d, k, groups=d, bias=bias, padding=k - 1)
         self.out_proj = nn.Linear(d, d, bias=bias)
 
-    def forward(self, x, attention_mask=None, seq_idx=None):
+    def forward(self, x, attention_mask=None, seq_idx=None, *, cache=None, layer_idx=None):
         if attention_mask is not None:
             x = x * attention_mask[..., None].to(x.dtype)
         b, g, z = self.in_proj(x).transpose(1, 2).chunk(3, dim=1)
         s = b * z
         if attention_mask is not None:
             s = s * attention_mask[:, None, :].to(s.dtype)
-        if seq_idx is None:
+        if cache is not None:
+            window = cache.update_conv(layer_idx, s)
+            y = F.conv1d(window.to(self.conv.weight.dtype), self.conv.weight,
+                         self.conv.bias, groups=self.conv.groups).to(s.dtype)
+        elif seq_idx is None:
             y = self.conv(s.to(self.conv.weight.dtype))[..., :x.size(1)].to(s.dtype)
         else:
             # Each width-k window reads only inputs from its own packed document.
@@ -199,10 +225,13 @@ class DecoderLayer(nn.Module):
             self.post_operator_norm = RMSNorm(c['dim'], c['norm_eps'])
             self.post_ffn_norm = RMSNorm(c['dim'], c['norm_eps'])
 
-    def forward(self, x, position_ids=None, attention_mask=None, seq_idx=None):
+    def forward(self, x, position_ids=None, attention_mask=None, seq_idx=None, *,
+                position_embeddings=None, cache=None, layer_idx=None):
         h = self.operator_norm(x)
-        h = (self.self_attn(h, position_ids, attention_mask) if self.is_attn
-             else self.conv(h, attention_mask, seq_idx))
+        h = (self.self_attn(h, position_ids, attention_mask,
+                           position_embeddings=position_embeddings, cache=cache, layer_idx=layer_idx)
+             if self.is_attn else self.conv(h, attention_mask, seq_idx,
+                                            cache=cache, layer_idx=layer_idx))
         if self.use_sandwich_norm:
             h = self.post_operator_norm(h)
         x = x + h
@@ -268,6 +297,107 @@ def _attention_masks(c, length, device, padding_mask=None, seq_idx=None):
     return masks
 
 
+class LFMCache:
+    """Inference state for one unpadded batch; owned by a single backbone.
+
+    Full attention retains all KV heads, sliding attention the previous W-1
+    tokens, and convolutions the previous K-1 projected B*z inputs. The latest
+    block's untrimmed updates permit rollback after speculative rejection.
+    """
+    def __init__(self, backbone):
+        self.backbone = backbone
+        self.length = self.start = 0
+        self.batch_size = None
+        self.device = self.dtype = None
+        self.attention = [None] * len(backbone.layers)
+        self.conv = [None] * len(backbone.layers)
+        self.pending = [None] * len(backbone.layers)
+        self.inv_freq = {}
+
+    def begin(self, ids, dtype):
+        if self.batch_size is None:
+            self.batch_size, self.device, self.dtype = ids.shape[0], ids.device, dtype
+        if (ids.shape[0], ids.device, dtype) != (self.batch_size, self.device, self.dtype):
+            raise ValueError('Cache batch size, device, and dtype must remain unchanged')
+        self.start = self.length
+        self.pending = [None] * len(self.pending)
+
+    def _store_attention(self, index, k, v):
+        c = self.backbone.c
+        if c['layers'][index] == 'sliding_attention':
+            keep = c['sliding_window'] - 1
+            if k.shape[-2] > keep:
+                k = k[..., -keep:, :].clone() if keep else k[..., :0, :].clone()
+                v = v[..., -keep:, :].clone() if keep else v[..., :0, :].clone()
+        self.attention[index] = (k, v)
+
+    def update_attention(self, index, k, v):
+        previous = self.attention[index]
+        if previous is not None:
+            k = torch.cat((previous[0], k), dim=-2)
+            v = torch.cat((previous[1], v), dim=-2)
+        self.pending[index] = (k, v)
+        self._store_attention(index, k, v)
+        return k, v
+
+    def _store_conv(self, index, window):
+        keep = self.backbone.c['conv_kernel'] - 1
+        self.conv[index] = window[..., -keep:].clone() if keep else window[..., :0].clone()
+
+    def update_conv(self, index, s):
+        previous = self.conv[index]
+        window = (F.pad(s, (self.backbone.c['conv_kernel'] - 1, 0)) if previous is None
+                  else torch.cat((previous, s), dim=-1))
+        self.pending[index] = window
+        self._store_conv(index, window)
+        return window
+
+    def crop(self, length):
+        """Commit a prefix of the latest block, including zero accepted inputs."""
+        if not self.start <= length <= self.length:
+            raise ValueError('Can only crop within the latest cached forward')
+        rejected = self.length - length
+        if rejected:
+            for index, update in enumerate(self.pending):
+                if isinstance(update, tuple):
+                    k, v = update
+                    self._store_attention(index, k[..., :-rejected, :], v[..., :-rejected, :])
+                elif update is not None:
+                    self._store_conv(index, update[..., :-rejected])
+        self.length = self.start = length
+        self.pending = [None] * len(self.pending)
+
+    def position_embeddings(self, positions, dtype):
+        c = self.backbone.c
+        embeddings = {}
+        for kind in set(c['layers']) & set(ATTENTION_TYPES):
+            if kind not in self.inv_freq:
+                p = c['rope_parameters'][kind]
+                self.inv_freq[kind] = _rotary_inv_freq(
+                    c['head_dim'], p['rope_theta'], p.get('partial_rotary_factor', 1.0), positions.device)
+            embeddings[kind] = _rotary_embeddings(self.inv_freq[kind], positions, dtype)
+        return embeddings
+
+
+def _cached_attention_masks(c, start, length, device):
+    """Bottom-right causal masks for chunks; one-token decode needs no mask."""
+    masks = {}
+    for kind in set(c['layers']) & set(ATTENTION_TYPES):
+        window = c['sliding_window'] if kind == 'sliding_attention' else None
+        if length == 1 or (start == 0 and (window is None or length <= window)):
+            masks[kind] = None
+            continue
+        past = start if window is None else min(start, window - 1)
+        queries = torch.arange(start, start + length, device=device)
+        keys = torch.arange(start - past, start + length, device=device)
+        distance = queries[:, None] - keys[None, :]
+        mask = distance >= 0
+        if window is not None:
+            mask = mask & (distance < window)
+        masks[kind] = mask[None, None]
+    return masks
+
+
 class LFMBackbone(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -286,6 +416,30 @@ class LFMBackbone(nn.Module):
         for kind, layer in zip(self.c['layers'], self.layers):
             mask = padding if kind == 'conv' else masks[kind]
             x = layer(x, positions, mask, docs)
+        return self.embedding_norm(x)
+
+    @torch.inference_mode()
+    def forward_cached(self, ids, cache):
+        """Process only new tokens at cache.length; padding/packing use forward()."""
+        if self.training:
+            raise ValueError('Cached inference requires model.eval()')
+        if cache.backbone is not self:
+            raise ValueError('Cache belongs to a different backbone')
+        if ids.ndim != 2 or ids.shape[0] == 0 or ids.shape[1] == 0:
+            raise ValueError('ids must be a nonempty [batch, time] tensor')
+        if ids.device != self.embed_tokens.weight.device:
+            raise ValueError('Input and model must be on the same device')
+        if cache.length + ids.shape[1] > self.c['max_position_embeddings']:
+            raise ValueError('Generation exceeds the configured context length')
+        cache.begin(ids, self.embed_tokens.weight.dtype)
+        positions = torch.arange(cache.length, cache.length + ids.shape[1], device=ids.device)[None]
+        masks = _cached_attention_masks(self.c, cache.length, ids.shape[1], ids.device)
+        x = self.embed_tokens(ids)
+        embeddings = cache.position_embeddings(positions, x.dtype)
+        for index, (kind, layer) in enumerate(zip(self.c['layers'], self.layers)):
+            x = layer(x, positions, masks.get(kind),
+                      position_embeddings=embeddings.get(kind), cache=cache, layer_idx=index)
+        cache.length += ids.shape[1]
         return self.embedding_norm(x)
 
 
@@ -307,6 +461,18 @@ class LFMPolicy(nn.Module):
         logits = self.lm_head(hs)
         values = self.value_head(hs).squeeze(-1) if with_values else None
         return logits, values
+
+    @torch.inference_mode()
+    def prefill(self, ids):
+        """Encode an unpadded prompt once; return [B,1,V] next-token logits and cache."""
+        cache = LFMCache(self.model)
+        hidden = self.model.forward_cached(ids, cache)
+        return self.lm_head(hidden[:, -1:]), cache
+
+    @torch.inference_mode()
+    def decode_step(self, ids, cache):
+        """Return [B,T,V] logits for new input tokens, updating the supplied cache."""
+        return self.lm_head(self.model.forward_cached(ids, cache))
 
 
 class LFMCritic(nn.Module):

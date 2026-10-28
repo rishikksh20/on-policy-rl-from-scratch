@@ -5,8 +5,8 @@
     python test_lfm3.py              # checks, download, and generate
     python test_lfm3.py --offline    # checks and generate from local files
 
-Verified text streams live, with tok/s printed at the end. Prompt-lookup
-speculative decoding is enabled without a second model. Edit SAMPLING and
+Verified text streams live, with tok/s printed at the end. Cached prefill/decode
+is the default; prompt-lookup speculation is optional. Edit SAMPLING and
 SPECULATION below for advanced settings. Device/dtype: CUDA/BF16 or CPU/FP32.
 No Hugging Face runtime libraries are imported. Generation additionally uses
 regex for Unicode tokenization and Jinja2 for the official chat template.
@@ -44,7 +44,7 @@ DEFAULT_DIRECTORY = Path(__file__).resolve().parent / 'checkpoints' / 'LFM3-1.7B
 PROMPT = 'What is C. elegans?'
 SAMPLING = dict(max_new_tokens=2048, temperature=0.1, top_k=50,
                 repetition_penalty=1.1, seed=42)
-SPECULATION = dict(enabled=True, max_draft_tokens=4, max_ngram_size=4)
+SPECULATION = dict(enabled=False, max_draft_tokens=4, max_ngram_size=4)
 
 
 # Checkpoint downloads and architecture validation.
@@ -360,13 +360,15 @@ def sample_next_token(logits, history, temperature, top_k, repetition_penalty, g
 
 
 @torch.inference_mode()
-def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=None, metrics=None):
+def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=None, metrics=None,
+             use_cache=True):
     """Verify prompt-lookup drafts in blocks and stream only committed tokens.
 
     For a deterministic draft, sampling from the target and accepting a proposed
     token only when it matches is exact: accept probability is p(draft), and a
     mismatch is already a sample from p conditioned on not choosing that draft.
-    After a mismatch, later block logits are discarded. No stale cache is kept.
+    After a mismatch, later block logits and their attention/convolution states
+    are discarded. use_cache=False keeps a full-prefix baseline for comparison.
     """
     max_new_tokens = SAMPLING['max_new_tokens'] if max_new_tokens is None else max_new_tokens
     temperature, top_k, repetition_penalty, seed = (
@@ -384,9 +386,12 @@ def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
     started = time.perf_counter()
-    counts = dict(target_forward_passes=0, speculative_rounds=0,
+    counts = dict(target_forward_passes=0, prefill_passes=0, decode_passes=0,
+                  processed_input_tokens=0, speculative_rounds=0,
                   proposed_draft_tokens=0, accepted_draft_tokens=0)
     first_token_seconds = None
+    prefill_seconds = None
+    cache = None
     stop = 'max_new_tokens'
     while len(generated) < max_new_tokens:
         history = prompt_ids + generated
@@ -397,18 +402,36 @@ def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=
         draft_limit = min(SPECULATION['max_draft_tokens'], context_room,
                           max_new_tokens - len(generated) - 1)
         draft = (lookup_draft(history, draft_limit, SPECULATION['max_ngram_size'])[:draft_limit]
-                 if SPECULATION['enabled'] and draft_limit > 0 else [])
+                 if SPECULATION['enabled'] and draft_limit > 0 and (not use_cache or cache is not None)
+                 else [])
         for index, token in enumerate(draft):
             if token in eos:
                 draft = draft[:index + 1]
                 break
         counts['proposed_draft_tokens'] += len(draft)
         counts['speculative_rounds'] += bool(draft)
-        ids = torch.tensor([history + draft], dtype=torch.long, device=device)
-        hidden = model.model(ids)
+        # The cache ends just before the last committed token. Only that pending
+        # token and any proposed continuation need another backbone forward.
+        new_ids = history[cache.length:] + draft if cache is not None else history + draft
+        ids = torch.tensor([new_ids], dtype=torch.long, device=device)
+        if use_cache:
+            if cache is None:
+                prefill_started = time.perf_counter()
+                logits, cache = model.prefill(ids)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                prefill_seconds = time.perf_counter() - prefill_started
+                counts['prefill_passes'] += 1
+            else:
+                logits = model.decode_step(ids, cache)
+                counts['decode_passes'] += 1
+            logits = logits[0]
+        else:
+            hidden = model.model(ids)
+            logits = model.lm_head(hidden[:, -(len(draft) + 1):])[0]
         # Row i predicts draft[i]; the final row supplies the all-accepted bonus.
-        logits = model.lm_head(hidden[:, -(len(draft) + 1):])[0]
         counts['target_forward_passes'] += 1
+        counts['processed_input_tokens'] += len(new_ids)
         for index, row in enumerate(logits):
             token = sample_next_token(row, history, temperature, top_k, repetition_penalty, rng)
             is_draft = index < len(draft)
@@ -425,6 +448,10 @@ def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=
                 break
             if len(generated) == max_new_tokens or (is_draft and not matches):
                 break
+        if cache is not None:
+            # Keep the accepted draft inputs, excluding the newly sampled token
+            # that has not yet been fed into the model. Roll back both operators.
+            cache.crop(len(history) - 1)
         if stop == 'eos_token':
             break
     if device.type == 'cuda':
@@ -432,8 +459,12 @@ def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=
     elapsed = time.perf_counter() - started
     if metrics is not None:
         proposed = counts['proposed_draft_tokens']
-        metrics.update(counts, method='prompt_lookup_speculative' if SPECULATION['enabled'] else 'autoregressive',
+        method = 'prompt_lookup_speculative' if SPECULATION['enabled'] else 'autoregressive'
+        decode_seconds = elapsed - first_token_seconds
+        metrics.update(counts, method=('cached_' if use_cache else '') + method, use_cache=use_cache,
                        elapsed_seconds=elapsed, tokens_per_second=len(generated) / elapsed,
+                       prefill_seconds=prefill_seconds,
+                       decode_tokens_per_second=(len(generated) - 1) / decode_seconds if decode_seconds > 0 else 0.0,
                        time_to_first_token_seconds=first_token_seconds,
                        draft_acceptance_rate=counts['accepted_draft_tokens'] / proposed if proposed else 0.0)
     return generated, stop
@@ -483,9 +514,13 @@ def run_generation(prompt=PROMPT, max_new_tokens=None, offline=False):
     streamer.finish()
     print(f'Speed: {performance["tokens_per_second"]:.2f} tok/s | '
           f'{len(generated)} tokens in {performance["elapsed_seconds"]:.2f}s', file=sys.stderr, flush=True)
-    print(f'Speculation: {performance["accepted_draft_tokens"]}/{performance["proposed_draft_tokens"]} '
-          f'draft tokens accepted; {performance["target_forward_passes"]} target passes',
-          file=sys.stderr, flush=True)
+    print(f'Cache: {performance["prefill_passes"]} prefill ({performance["prefill_seconds"]:.3f}s), '
+          f'{performance["decode_passes"]} decode passes | '
+          f'Decode: {performance["decode_tokens_per_second"]:.2f} tok/s', file=sys.stderr, flush=True)
+    if SPECULATION['enabled']:
+        print(f'Speculation: {performance["accepted_draft_tokens"]}/{performance["proposed_draft_tokens"]} '
+              f'draft tokens accepted; {performance["target_forward_passes"]} target passes',
+              file=sys.stderr, flush=True)
     raw_text = tokenizer.decode(generated)
     if not raw_text.strip():
         raise RuntimeError('Generation produced no text')
@@ -836,6 +871,85 @@ class ModelTests(SeededTestCase):
                     self.assertTrue(torch.isfinite(p.grad).all(), name)
 
 
+class CacheTests(SeededTestCase):
+    def test_prefill_and_chunked_decode_match_full_prefix_across_windows(self):
+        ids = torch.randint(2, 96, (2, 16))
+        for window in (1, 3, 256):
+            for bias in (False, True):
+                for prompt_length in (1, 7):
+                    with self.subTest(window=window, bias=bias, prompt_length=prompt_length):
+                        c = lfm3.cfg(tiny=True)
+                        c.update(sliding_window=window, conv_bias=bias)
+                        model = lfm3.LFMPolicy(c).eval()
+                        with torch.inference_mode():
+                            expected = model(ids)[0]
+                        logits, cache = model.prefill(ids[:, :prompt_length])
+                        torch.testing.assert_close(logits, expected[:, prompt_length-1:prompt_length],
+                                                   atol=3e-5, rtol=3e-5)
+                        offset = prompt_length
+                        while offset < ids.shape[1]:
+                            end = min(offset + (1 if offset % 2 else 4), ids.shape[1])
+                            logits = model.decode_step(ids[:, offset:end], cache)
+                            torch.testing.assert_close(logits, expected[:, offset:end],
+                                                       atol=3e-5, rtol=3e-5)
+                            self.assertFalse(logits.requires_grad)
+                            self.assertEqual(cache.length, end)
+                            for index, kind in enumerate(c['layers']):
+                                if kind == 'conv':
+                                    self.assertEqual(cache.conv[index].shape[-1], c['conv_kernel'] - 1)
+                                else:
+                                    kept = end if kind == 'full_attention' else min(end, window - 1)
+                                    self.assertEqual(cache.attention[index][0].shape[-2], kept)
+                                    self.assertEqual(cache.attention[index][0].shape[1], c['kv_heads'])
+                            cache.crop(end)
+                            offset = end
+
+    def test_rejection_restores_attention_and_convolution_states(self):
+        c = lfm3.cfg(tiny=True)
+        c.update(sliding_window=3, conv_bias=True)
+        model = lfm3.LFMPolicy(c).eval()
+        ids = torch.randint(2, 96, (2, 15))
+        with torch.inference_mode():
+            expected = model(ids)[0]
+        for accepted in (0, 1, 3):
+            with self.subTest(accepted=accepted):
+                _, cache = model.prefill(ids[:, :6])
+                draft = ids[:, 6:11].clone()
+                draft[:, accepted:] = (draft[:, accepted:] + 5).remainder(96)
+                model.decode_step(draft, cache)
+                cache.crop(6 + accepted)
+                _, reference = model.prefill(ids[:, :6+accepted])
+                for actual, wanted in zip(cache.conv, reference.conv):
+                    if actual is not None:
+                        torch.testing.assert_close(actual, wanted, atol=2e-6, rtol=2e-5)
+                for actual, wanted in zip(cache.attention, reference.attention):
+                    if actual is not None:
+                        for a, w in zip(actual, wanted):
+                            torch.testing.assert_close(a, w, atol=2e-6, rtol=2e-5)
+                actual = model.decode_step(ids[:, 6+accepted:12], cache)
+                torch.testing.assert_close(actual, expected[:, 6+accepted:12], atol=3e-5, rtol=3e-5)
+
+    def test_cache_rejects_wrong_batch_owner_context_and_training_mode(self):
+        model, _ = lfm3.initialize(tiny=True, device='cpu')
+        ids = torch.tensor([[1, 22, 33]])
+        with self.assertRaisesRegex(ValueError, 'eval'):
+            model.prefill(ids)
+        model.eval()
+        _, cache = model.prefill(ids)
+        with self.assertRaisesRegex(ValueError, 'batch size'):
+            model.decode_step(ids.expand(2, -1), cache)
+        other, _ = lfm3.initialize(tiny=True, device='cpu')
+        other.eval()
+        with self.assertRaisesRegex(ValueError, 'different backbone'):
+            other.decode_step(ids, cache)
+        model.model.c['max_position_embeddings'] = 3
+        with self.assertRaisesRegex(ValueError, 'context length'):
+            model.decode_step(ids[:, :1], cache)
+        self.assertEqual(cache.length, 3)
+        with self.assertRaisesRegex(ValueError, 'latest cached forward'):
+            cache.crop(4)
+
+
 
 class CheckpointTests(SeededTestCase):
     def test_safetensors_reader_dtypes_and_bad_offsets(self):
@@ -993,6 +1107,47 @@ class GenerationTests(SeededTestCase):
                          ('', 'unfinished reasoning'))
         self.assertEqual(split_response(' answer ', False), ('answer', None))
 
+    def test_cached_generation_prefills_once_then_processes_one_token(self):
+        model, _ = lfm3.initialize(tiny=True, device='cpu')
+        metrics = {}
+        with patch.object(model.model, 'forward_cached', wraps=model.model.forward_cached) as forward:
+            with patch.object(sys.modules[__name__], 'sample_next_token', return_value=10):
+                with patch.dict(SPECULATION, enabled=False):
+                    tokens, stop = generate(model, [1, 22, 33], eos_token_ids=[7],
+                                            max_new_tokens=6, metrics=metrics)
+        self.assertEqual((tokens, stop), ([10] * 6, 'max_new_tokens'))
+        self.assertEqual([call.args[0].shape[1] for call in forward.call_args_list], [3, 1, 1, 1, 1, 1])
+        self.assertEqual(metrics['prefill_passes'], 1)
+        self.assertEqual(metrics['decode_passes'], 5)
+        self.assertEqual(metrics['processed_input_tokens'], 8)
+        self.assertTrue(metrics['use_cache'])
+        self.assertGreater(metrics['prefill_seconds'], 0)
+
+    def test_cached_speculation_keeps_logits_correct_after_partial_rejection(self):
+        c = lfm3.cfg(tiny=True)
+        c.update(sliding_window=3, conv_bias=True)
+        model = lfm3.LFMPolicy(c).eval()
+        prompt, streamed, metrics = [1, 22, 33], [], {}
+        expected = [4, 4, 5, 9, 4, 5, 6, 8, 7]
+
+        def draw(logits, history, *args):
+            # Check every prediction, including accepted drafts, against a fresh
+            # full-prefix forward so rejected convolution/KV state cannot leak.
+            self.assertEqual(history, prompt + streamed)
+            reference = model(torch.tensor([history]))[0][0, -1]
+            torch.testing.assert_close(logits, reference, atol=3e-5, rtol=3e-5)
+            return expected[len(streamed)]
+
+        with patch.dict(SPECULATION, enabled=True):
+            with patch.object(sys.modules[__name__], 'lookup_draft', return_value=[4, 5, 6]):
+                with patch.object(sys.modules[__name__], 'sample_next_token', side_effect=draw):
+                    tokens, stop = generate(model, prompt, eos_token_ids=[7], max_new_tokens=12,
+                                            on_token=streamed.append, metrics=metrics)
+        self.assertEqual((tokens, stop), (expected, 'eos_token'))
+        self.assertEqual(streamed, expected)
+        self.assertEqual(metrics['accepted_draft_tokens'], 5)
+        self.assertLess(metrics['accepted_draft_tokens'], metrics['proposed_draft_tokens'])
+
     def test_stream_flushes_before_finish_and_preserves_split_utf8(self):
         class BytesTokenizer:
             def token_bytes(self, token):
@@ -1022,8 +1177,9 @@ class GenerationTests(SeededTestCase):
 
     def test_speculative_blocks_reduce_passes_and_stream_committed_tokens(self):
         model, metrics, streamed = cycle_policy(), {}, []
-        tokens, stop = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0],
-                                max_new_tokens=8, on_token=streamed.append, metrics=metrics)
+        with patch.dict(SPECULATION, enabled=True):
+            tokens, stop = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0], use_cache=False,
+                                    max_new_tokens=8, on_token=streamed.append, metrics=metrics)
         self.assertEqual(tokens, [1, 2, 3, 1, 2, 3, 1, 2])
         self.assertEqual(streamed, tokens)
         self.assertEqual(stop, 'max_new_tokens')
@@ -1036,9 +1192,10 @@ class GenerationTests(SeededTestCase):
     def test_rejected_drafts_are_discarded_before_the_next_forward_or_stream(self):
         model, metrics, streamed = cycle_policy(), {}, []
         # The first two proposals are wrong: the target must emit 1, then 2.
-        with patch.object(sys.modules[__name__], 'lookup_draft', return_value=[3, 3, 3]):
-            tokens, _ = generate(model, [1, 2, 3], eos_token_ids=[0], max_new_tokens=6,
-                                  on_token=streamed.append, metrics=metrics)
+        with patch.dict(SPECULATION, enabled=True):
+            with patch.object(sys.modules[__name__], 'lookup_draft', return_value=[3, 3, 3]):
+                tokens, _ = generate(model, [1, 2, 3], eos_token_ids=[0], max_new_tokens=6,
+                                      on_token=streamed.append, metrics=metrics, use_cache=False)
         self.assertEqual(tokens, [1, 2, 3, 1, 2, 3])
         self.assertEqual(streamed, tokens)
         self.assertEqual(model.model.calls[1][0, :4].tolist(), [1, 2, 3, 1])
@@ -1051,22 +1208,22 @@ class GenerationTests(SeededTestCase):
                                                     repetition_penalty=1.5, seed=seed):
                 with patch.dict(SPECULATION, enabled=False):
                     expected, expected_stop = generate(cycle_policy(scale=1.1), prompt,
-                                                       eos_token_ids=[0], max_new_tokens=24)
+                                                       eos_token_ids=[0], max_new_tokens=24, use_cache=False)
                 with patch.dict(SPECULATION, enabled=True):
                     actual, stop = generate(cycle_policy(scale=1.1), prompt,
-                                            eos_token_ids=[0], max_new_tokens=24)
+                                            eos_token_ids=[0], max_new_tokens=24, use_cache=False)
                 self.assertEqual(actual, expected)
                 self.assertEqual(stop, expected_stop)
 
     def test_speculation_stops_on_eos_inside_a_draft_and_respects_context(self):
         streamed = []
         tokens, stop = generate(cycle_policy(), [1, 2, 3, 1, 2, 3], eos_token_ids=[2],
-                                max_new_tokens=8, on_token=streamed.append)
+                                max_new_tokens=8, on_token=streamed.append, use_cache=False)
         self.assertEqual((tokens, stop), ([1, 2], 'eos_token'))
         self.assertEqual(streamed, [1, 2])
         # Exactly one context position remains; the block must be clipped to fit.
         model = cycle_policy(context=7)
-        tokens, _ = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0], max_new_tokens=2)
+        tokens, _ = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0], max_new_tokens=2, use_cache=False)
         self.assertEqual(tokens, [1, 2])
         self.assertTrue(all(ids.shape[1] <= 7 for ids in model.model.calls))
 
