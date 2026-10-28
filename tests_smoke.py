@@ -26,6 +26,7 @@ grpo=module('03_grpo.py','grpo')
 rlvr=module('04_rlvr_code_verifier.py','rlvr')
 independent=module('05_ppo_independent_critic.py','independent')
 grpo_preference=module('06_grpo_preference_reward.py','grpo_preference')
+dapo_preference=module('07_dapo_preference_reward.py','dapo_preference')
 
 
 def write_safetensors(path,tensors):
@@ -263,7 +264,7 @@ for actions in ([10,7],[10]):
     assert torch.allclose(result['returns'][-1],torch.tensor(result['score']),atol=1e-6)
 
 # 16. Sampling cannot silently disagree with rescoring or emit empty trajectories.
-for script in (ppo,ppo_preference,grpo,rlvr,independent,grpo_preference):
+for script in (ppo,ppo_preference,grpo,rlvr,independent,grpo_preference,dapo_preference):
     for kwargs in ({'temperature':0.5},{'max_new':0},{'prompt':[]}):
         try:
             script.sample_tokens(actor,**({'prompt':prompt}|kwargs))
@@ -285,4 +286,128 @@ for script in (ppo,ppo_preference,grpo,rlvr,independent,grpo_preference):
                 pass
             else:
                 raise AssertionError(f'{script.__name__} accepted invalid data: {row}')
-print('All architecture, PPO/GRPO, preference reward, independent critic, safetensors, verifier, and audit regression tests PASSED.')
+
+# 17. DAPO uses the same pairwise RM training and keeps its backbone/actor fixed.
+torch.manual_seed(42)
+dapo=dapo_preference
+dapo_actor,_=lfm.initialize(tiny=True,device='cpu')
+dapo_rm=dapo.LearnedReward(dapo_actor,lfm.cfg(tiny=True))
+actor_before={n:p.detach().clone() for n,p in dapo_actor.named_parameters()}
+backbone_before={n:p.detach().clone() for n,p in dapo_rm.backbone.named_parameters()}
+with torch.no_grad():
+    margin_before=dapo_rm(prompt,[10])-dapo_rm(prompt,[11])
+dapo.train_reward_model(dapo_rm,prefs,epochs=3,lr=0.01)
+with torch.no_grad():
+    assert dapo_rm(prompt,[10])-dapo_rm(prompt,[11])>margin_before
+assert not dapo_rm.training and all(not p.requires_grad for p in dapo_rm.parameters())
+assert all(p.grad is None for p in dapo_rm.parameters())
+assert not hasattr(dapo_actor,'value_head')
+for name,p in dapo_actor.named_parameters():
+    assert torch.equal(p,actor_before[name]),name
+for name,p in dapo_rm.backbone.named_parameters():
+    assert torch.equal(p,backbone_before[name]),name
+
+# 18. Soft length shaping is continuous at the buffer boundary and capped.
+assert dapo.soft_overlong_reward(6,10,4)==0.0
+assert dapo.soft_overlong_reward(7,10,4)==-0.25
+assert dapo.soft_overlong_reward(10,10,4)==-1.0
+assert dapo.soft_overlong_reward(12,10,4,penalty=2.)==-2.0
+assert dapo.soft_overlong_reward(10,10,0)==0.0
+for kwargs in ({'soft_overlong':11},{'soft_overlong':-1},{'penalty':-1.}):
+    try:
+        dapo.soft_overlong_reward(5,10,**kwargs)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Invalid soft-overlong options accepted')
+with patch.object(dapo,'sample_tokens',side_effect=[[10,7],[11,12,7],[11,12,13]]):
+    shaped=dapo.group_rollout(dapo_actor,dapo_rm,prompt,3,3,[7,10,11,12,13],soft_overlong=1)
+assert [item['length_reward'] for item in shaped]==[0.,-1.,-1.]
+assert [item['truncated'] for item in shaped]==[False,False,True]
+for item in shaped:
+    assert item['raw_reward']==dapo_rm(prompt,item['actions']).item()
+    assert item['reward']==item['raw_reward']+item['length_reward']
+    assert item['old_lp'].shape==(len(item['actions']),)
+shaped_rewards=torch.tensor([item['reward'] for item in shaped])
+assert torch.allclose(torch.stack([item['advantage'] for item in shaped]),
+                      (shaped_rewards-shaped_rewards.mean())/(shaped_rewards.std(unbiased=False)+1e-6))
+
+# 19. Dynamic sampling drops tied groups, advances prompts and fills a batch
+# under one unchanged actor. Every accepted group has its OWN reward baseline.
+dapo_records=prefs+[{'prompt_ids':[1,34,35],'chosen_ids':[10],'rejected_ids':[11]}]
+with patch.object(dapo,'sample_tokens',
+                  side_effect=[[10]]*4+[[10],[11],[10],[11]]*2) as sample:
+    dapo_groups,attempts=dapo.dynamic_rollout(
+        dapo_actor,dapo_rm,dapo_records,4,1,allowed,batch_size=2,max_attempts=3)
+assert attempts==3 and len(dapo_groups)==2 and sample.call_count==12
+assert dapo_groups[0][0]['prompt_ids']==dapo_records[1]['prompt_ids']
+assert dapo_groups[1][0]['prompt_ids']==dapo_records[0]['prompt_ids']
+for group in dapo_groups:
+    rewards=torch.tensor([item['reward'] for item in group])
+    advantages=torch.stack([item['advantage'] for item in group])
+    assert torch.allclose(advantages,(rewards-rewards.mean())/(rewards.std(unbiased=False)+1e-6))
+    for item in group:
+        assert item['reward']==dapo_rm(item['prompt_ids'],item['actions']).item()
+        assert not item['old_lp'].requires_grad and not item['advantage'].requires_grad
+        assert 'ref_lp' not in item
+for name,p in dapo_actor.named_parameters():
+    assert torch.equal(p,actor_before[name]),name
+with patch.object(dapo,'sample_tokens',return_value=[10]) as sample:
+    empty,attempts=dapo.dynamic_rollout(dapo_actor,dapo_rm,prefs,4,1,allowed,
+                                       max_attempts=3,min_reward_std=0.)
+assert empty==[] and attempts==3 and sample.call_count==12
+
+# 20. Independent numeric example: asymmetric clipping AND global token mean.
+# +A: ratio 1.25 still learns, 1.4 clips to 1.28. -A: 0.7 clips to 0.8;
+# 0.85 and 1.5 still learn. Unequal lengths distinguish this from GRPO.
+toy=torch.nn.Linear(1,1,bias=False)
+torch.nn.init.zeros_(toy.weight)
+positive=dict(prompt_ids=prompt,actions=[10,10],old_lp=torch.zeros(2),advantage=torch.tensor(1.))
+negative=dict(prompt_ids=prompt,actions=[11,11,11],old_lp=torch.zeros(3),advantage=torch.tensor(-1.))
+def toy_log_probs(policy,prompt,actions,allowed_ids=None):
+    ratios=[1.25,1.4] if actions[0]==10 else [0.7,0.85,1.5]
+    return torch.tensor(ratios).log()+policy.weight.sum(),None
+with patch.object(dapo,'positions_log_probs',side_effect=toy_log_probs):
+    loss=dapo.dapo_update(toy,torch.optim.SGD(toy.parameters(),lr=0.),
+                          [[positive],[negative]],None,epochs=1)
+assert abs(loss-(-1.25-1.28+0.8+0.85+1.5)/5)<1e-6
+assert torch.allclose(toy.weight.grad,torch.tensor([[(-1.25+0.85+1.5)/5]]),atol=1e-6)
+
+# 21. DAPO improves preference log odds using multiple groups/epochs, updates
+# only the actor, and preserves cached behavior logprobs and advantages.
+rm_before={n:p.detach().clone() for n,p in dapo_rm.named_parameters()}
+cached=[(item['old_lp'].clone(),item['advantage'].clone())
+        for group in dapo_groups for item in group]
+def preference_log_odds():
+    return torch.stack([
+        dapo.positions_log_probs(dapo_actor,row['prompt_ids'],[10],allowed_ids=allowed)[0]
+        -dapo.positions_log_probs(dapo_actor,row['prompt_ids'],[11],allowed_ids=allowed)[0]
+        for row in dapo_records]).mean()
+with torch.no_grad():
+    odds_before=preference_log_odds()
+loss=dapo.dapo_update(dapo_actor,torch.optim.AdamW(dapo_actor.parameters(),lr=1e-3),
+                      dapo_groups,allowed,epochs=2)
+assert torch.isfinite(torch.tensor(loss))
+with torch.no_grad():
+    assert preference_log_odds()>odds_before
+assert any(not torch.equal(p,actor_before[n]) for n,p in dapo_actor.named_parameters())
+for name,p in dapo_rm.named_parameters():
+    assert torch.equal(p,rm_before[name]),name
+    assert p.grad is None
+for item,(old_lp,advantage) in zip((i for g in dapo_groups for i in g),cached):
+    assert torch.equal(item['old_lp'],old_lp)
+    assert torch.equal(item['advantage'],advantage)
+
+# 22. Main skips an unfilled batch: no policy optimizer step, even weight decay.
+actor_before={n:p.detach().clone() for n,p in dapo_actor.named_parameters()}
+with patch('sys.argv',['07_dapo_preference_reward.py','--tiny','--steps','1',
+                       '--batch-size','2','--max-sampling-attempts','2','--rm-epochs','1']), \
+     patch.object(dapo,'initialize',return_value=(dapo_actor,'cpu')), \
+     patch.object(dapo,'sample_tokens',side_effect=[[10],[11],[10],[11]]+[[10]]*4), \
+     patch.object(dapo,'dapo_update') as update:
+    dapo.main()
+    update.assert_not_called()
+for name,p in dapo_actor.named_parameters():
+    assert torch.equal(p,actor_before[name]),name
+
+print('All architecture, PPO/GRPO/DAPO, preference reward, independent critic, safetensors, verifier, and audit regression tests PASSED.')

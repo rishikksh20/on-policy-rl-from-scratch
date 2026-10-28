@@ -1,8 +1,8 @@
 # Real LFM2.5-230M • PyTorch-only On-Policy Reinforcement Learning 
 
-Six `.py` trainers using shared model code in `lfm.py`, no TRL, veRL, Hugging Face Transformers, `safetensors` package, or third-party RL framework in their training code. They reimplement the **real hybrid LFM2.5-230M architecture in PyTorch**, not a toy GRU (8 double-gated short convolution layers + 6 grouped-query attention layers, 14 layers in total, RMSNorm, SwiGLU, RoPE, 65,536 vocab, 229,693,184 unique model parameters). The raw BF16 HF checkpoint is read with a small standard-library safetensors reader; weights are loaded to FP32 for a simple training example.
+Seven `.py` trainers using shared model code in `lfm.py`, no TRL, veRL, Hugging Face Transformers, `safetensors` package, or third-party RL framework in their training code. They reimplement the **real hybrid LFM2.5-230M architecture in PyTorch**, not a toy GRU (8 double-gated short convolution layers + 6 grouped-query attention layers, 14 layers in total, RMSNorm, SwiGLU, RoPE, 65,536 vocab, 229,693,184 unique model parameters). The raw BF16 HF checkpoint is read with a small standard-library safetensors reader; weights are loaded to FP32 for a simple training example.
 
-**What I verified:** All six `--tiny` training loops run and produce differentiable updates, independent actor/critic backbones load a synthetic checkpoint and update separately, GRPO/RLVR show groups with positive/negative advantages, preference-reward GRPO updates the actor while keeping the reward model frozen, model architecture size computes to exactly 229,693,184 parameters. **What I could not test here:** a forward/training run with the real 459 MB HF checkpoint (not downloaded in this environment) or decoding the actual tokenizer.json. See caveats below. Do not treat this as production-grade RL training.
+**What I verified:** All seven `--tiny` training loops run and produce differentiable updates, independent actor/critic backbones load a synthetic checkpoint and update separately, GRPO/RLVR show groups with positive/negative advantages, preference-reward GRPO and DAPO update the actor while keeping the reward model frozen, DAPO clipping/token weighting/dynamic sampling/length shaping pass offline checks, model architecture size computes to exactly 229,693,184 parameters. **What I could not test here:** a forward/training run with the real 459 MB HF checkpoint (not downloaded in this environment) or decoding the actual tokenizer.json. See caveats below. Do not treat this as production-grade RL training.
 
 ## 1. Files
 
@@ -14,13 +14,14 @@ Six `.py` trainers using shared model code in `lfm.py`, no TRL, veRL, Hugging Fa
 | `04_rlvr_code_verifier.py` | RLVR coding | LFM actor + GRPO optimizer, AST-checked unit tests |
 | `05_ppo_independent_critic.py` | Exact-match PPO with an independent critic | Separate pretrained LFM actor and critic backbones, deterministic verifier |
 | `06_grpo_preference_reward.py` | Group-relative RL from subjective preferences | LFM actor + trained, frozen preference reward model; **no critic** |
+| `07_dapo_preference_reward.py` | DAPO from subjective preferences | LFM actor + trained, frozen preference reward model; asymmetric clipping, dynamic sampling, token-level loss, soft length penalty; **no critic** |
 | `lfm.py` | Shared model implementation | LFM architecture, policy/value heads, configuration, checkpoint loading, model initialization |
 | `lfm3.py` | Separate pure PyTorch LFM3-1.7B implementation | Same policy/critic interfaces, gated full/sliding attention, width-7 convolutions, local checkpoint loading |
 | `lfm3.md` | LFM3 architecture reference | Exact supplied config, partial RoPE layout, sandwich norms, checkpoint tensors, usage, and implementation limits |
 | `test_lfm3.py` | Combined LFM3 tests and real-model generation | Grouped offline tests, verified downloads, tokenizer, and local PyTorch generation without Hugging Face runtime libraries |
 | `prepare_data_optional.py` | Turn human-readable prompts into model token IDs | This **one-time optional** step uses the official Transformers tokenizer; trainers don't depend on it |
 
-All six trainers import their model implementation from `lfm.py`; keep it alongside the scripts. Dataset loading, sampling, rewards, and RL losses stay in the trainers.
+All seven trainers import their model implementation from `lfm.py`; keep it alongside the scripts. Dataset loading, sampling, rewards, and RL losses stay in the trainers.
 
 For the separate LFM3 implementation, see [`lfm3.md`](lfm3.md) and run `python test_lfm3.py --unit` for offline architecture, equation, gradient, and checkpoint checks. Its interfaces follow `lfm.py`; adapting an existing trainer also requires LFM3 tokenized data and special-token IDs.
 
@@ -40,6 +41,7 @@ python 03_grpo.py --tiny --steps 3 --group-size 4 --lr 0.001
 python 04_rlvr_code_verifier.py --tiny --steps 3 --group-size 4 --lr 0.001
 python 05_ppo_independent_critic.py --tiny --steps 3 --lr 0.001 --critic-lr 0.001
 python 06_grpo_preference_reward.py --tiny --steps 3 --group-size 4 --lr 0.001
+python 07_dapo_preference_reward.py --tiny --steps 3 --group-size 4 --lr 0.001
 python tests_smoke.py
 ```
 
@@ -68,6 +70,9 @@ python 03_grpo.py --checkpoint checkpoint/model.safetensors --data tokenized/num
 
 # GRPO with a learned preference reward model, using the same data as PPO variant 2
 python 06_grpo_preference_reward.py --checkpoint checkpoint/model.safetensors --data tokenized/preferences_tokens.jsonl --rm-epochs 10 --group-size 4 --steps 20 --max-new 24 --lr 1e-5
+
+# DAPO with the same preference dataset, two accepted prompt groups per update
+python 07_dapo_preference_reward.py --checkpoint checkpoint/model.safetensors --data tokenized/preferences_tokens.jsonl --rm-epochs 10 --group-size 4 --batch-size 2 --steps 20 --max-new 24 --soft-overlong 6 --lr 1e-5
 
 # RLVR where the model writes arithmetic expressions; AST verifier runs unit tests
 python 04_rlvr_code_verifier.py --checkpoint checkpoint/model.safetensors --tokenizer checkpoint/tokenizer.json --data tokenized/coding_tokens.jsonl --group-size 4 --steps 20 --max-new 24 --lr 1e-5
@@ -105,7 +110,7 @@ The optional preprocessor transforms it into **numeric token IDs** (values below
 
 The model may generate a correct mathematical answer in a different tokenization or phrasing and still get zero: this **strict token-level verifier is deliberately simplistic**. In practical numeric RLVR, decode the text, parse the number, and compare numerical values, not token IDs.
 
-### 3C. Preference dataset for learned reward (scripts 02 and 06)
+### 3C. Preference dataset for learned reward (scripts 02, 06 and 07)
 
 Human-readable:
 
@@ -121,7 +126,7 @@ Model-ready token JSONL (the following IDs are deliberately fake examples to sho
 
 `chosen_ids` / `rejected_ids` are preferred and dispreferred *assistant continuations*, respectively. **These are NOT scalar reward targets.** The reward model learns a scalar from pairs via a pairwise preference loss.
 
-**Reward model dataset vs PPO dataset**: Pairwise human-labeled rows train the reward model first. For PPO, only `prompt_ids` are used to generate new model responses. The trained reward model scores those *new* responses. The chosen/rejected examples are not copied into PPO rollouts.
+**Reward model dataset vs policy dataset**: Pairwise human-labeled rows train the reward model first. For PPO, GRPO and DAPO, only `prompt_ids` are used to generate new model responses. The trained reward model scores those *new* responses. The chosen/rejected examples are not copied into policy rollouts.
 
 ### 3D. RLVR coding dataset
 
@@ -254,7 +259,38 @@ The scripts use a nonnegative sampled KL estimator:
 
 If every rollout in a group gets the *same* reward, all `A_i=0`; then there is no outcome-policy learning signal (only any reference KL penalty remains). This is a fundamental sparse-reward issue, not a code bug.
 
-## 7. RLVR objective — verifiable rewards + GRPO
+## 7. DAPO with preference rewards — no critic
+
+Script **07** implements **Decoupled Clip and Dynamic sAmpling Policy Optimization**, introduced by ByteDance Seed and collaborators in 2025. It adapts the [DAPO paper](https://arxiv.org/abs/2503.14476) to the **learned preference rewards** of script 06. The paper uses verifiable correctness rewards; this example trains a scalar reward head on chosen/rejected pairs, freezes it, and scores fresh actor responses with its raw output. There is no value head, TD error, GAE, or critic optimizer.
+
+DAPO keeps GRPO's group-relative advantages and changes the training loop:
+
+1. **Decoupled clipping:** `--clip-low 0.2` and `--clip-high 0.28` give the ratio interval `[0.8, 1.28]`. The larger upper bound lets positively advantaged actions increase further before the surrogate flattens.
+2. **Dynamic sampling:** reject groups whose population reward standard deviation is at or below `--min-reward-std` (default `1e-6`), then sample the next prompt until `--batch-size` accepted groups are collected. This reward-spread test adapts the paper's binary accuracy filtering to continuous preference scores. Every accepted group has its own mean/std, and all are sampled before the actor changes.
+3. **Token-level loss:** sum clipped losses over all generated tokens and divide by the total response-token count across the accepted batch. Longer responses contribute proportionally more tokens, unlike GRPO's equal weighting of response means.
+4. **Soft overlong reward:** add a penalty that ramps from zero at `max_new - soft_overlong` to `-overlong_penalty` at `max_new`. The default buffer is the last quarter of `max_new` (rounded down, at least one token); `--soft-overlong 0` disables it. EOS counts toward response length. Tiny mode uses one-token actions and disables shaping by default.
+
+For response length \(\ell\), limit \(M\), buffer \(B>0\) and penalty scale \(c\):
+
+\[
+r_i=r_\psi(x,y_i)-c\,\min\left(1,\max\left(0,\frac{\ell_i-(M-B)}{B}\right)\right),\qquad
+A_i=\frac{r_i-\mu_g}{\sigma_g+10^{-6}}
+\]
+
+Here \(\mu_g,\sigma_g\) are computed from the shaped rewards within response \(i\)'s prompt group. The actor minimizes:
+
+\[
+L_{\mathrm{DAPO}}=-\frac{1}{\sum_i |y_i|}\sum_i\sum_t
+\min\left(\rho_{it}A_i,\operatorname{clip}(\rho_{it},1-\epsilon_{\mathrm{low}},1+\epsilon_{\mathrm{high}})A_i\right)
+\]
+
+Following DAPO's objective, script 07 has **no reference-policy KL penalty** and does not allocate a reference model. Old-policy log probabilities and advantages are cached once and fixed over `--epochs` (default 2), then discarded before sampling the next batch.
+
+`--max-sampling-attempts` caps candidate groups per step (default 16). If the batch remains unfilled, the script reports a skipped step and performs **no optimizer update**, including weight decay. Logs show accepted/sampled groups, token count, truncations, raw/shaped rewards and advantages. Prompt selection cycles through the preference dataset, including retries.
+
+The length penalty is in raw reward-model score units; `--overlong-penalty` controls its strength (default 1). Unlike group standardization alone, adding a length penalty makes reward scale matter. This example uses soft shaping without masking truncated responses, and is an educational preference-reward adaptation rather than a reproduction of the paper's math-training recipe.
+
+## 8. RLVR objective — verifiable rewards + GRPO
 
 **RLVR does not define a new optimizer.** It means rewards are verified from objective evidence (unit tests, exact answers, a math evaluator, a tool outcome). The RLVR script calls `verify_unit_tests(generated_code,tests)`:
 
@@ -264,7 +300,7 @@ r(q,y)=\begin{cases}1,&\text{code is syntactically allowed and passes every test
 
 Then sample G codes, derive GRPO group-relative advantages, and use the **same GRPO clipped-policy update as script 03**. Code verifier handles **task success**; GRPO handles **gradient optimization**. There is no supervised target string in the RLVR dataset.
 
-## 8. Walk through the functions
+## 9. Walk through the functions
 
 | Function | Role |
 |---|---|
@@ -281,19 +317,22 @@ Then sample G codes, derive GRPO group-relative advantages, and use the **same G
 | `train_reward_model` | Update reward head on chosen/rejected preference data |
 | `group_rollout` | Sample G candidates for one prompt, get rewards and normalize into GRPO advantages |
 | `grpo_update` | Clipped policy and reference KL without critic |
+| `soft_overlong_reward` (script 07) | Add a linear length penalty near the generation limit |
+| `dynamic_rollout` (script 07) | Reject groups without reward variation and refill the accepted batch, with a sampling cap |
+| `dapo_update` (script 07) | Asymmetric clipped policy loss averaged across all response tokens, without reference KL |
 | `Decoder.decode` | Convert actual tokenizer IDs into generated program text for coding verification |
 | `extract_expression`, `arithmetic`, `verify_unit_tests` | Parse/interpret a tiny safe expression grammar and compare unit-test outputs |
 | `verified_group` | Group sampling + unit-test scoring + normalized advantages |
 | `update_with_grpo` | GRPO updates using verified coding rewards |
 
-## 9. Real-world caveats and suggested improvements
+## 10. Real-world caveats and suggested improvements
 
 1. **Real checkpoint integration is structurally matched but not integration-tested here.** Confirm actual `model.safetensors` strict loading and decoded outputs against the official Transformers inference baseline before investing in training.
 2. **Tokenizer fidelity matters.** The optional data-preparation file uses the official chat template; RLVR has only a lightweight **decoder** for common ByteLevel/Metaspace tokenizers, not a complete reproduction of `tokenizer.json`'s postprocessing. Validate round-trip decoding with official tokenizer. Any mismatch corrupts coding rewards.
 3. **A small toy dataset will not make pretrained LFM learn general behavior.** Use hundreds/thousands of training problems, held-out evaluation, sensible lengths, and multiple rollouts.
 4. **True sparse rewards are hard**: random completions seldom pass exact-match checks. Add curriculum, stronger SFT initialization, reasonable sample lengths and tasks with solvable outputs, and report success/variance rates.
-5. These examples use **batch=1, no KV cache, serial sampling, FP32 AdamW, no activation checkpointing or adaptive KL controller**. They are intentionally inefficient. Full PPO + reference + RM + critic can require significant VRAM; use appropriately sized devices and reduce lengths if needed.
+5. These examples default to **one prompt group per update, no KV cache, serial sampling, FP32 AdamW, no activation checkpointing or adaptive KL controller**. DAPO supports multiple accepted prompt groups via `--batch-size`. They are intentionally inefficient. Full PPO + reference + RM + critic can require significant VRAM; use appropriately sized devices and reduce lengths if needed.
 6. **Token limits:** PPO and GRPO score the response as finished at EOS or the token limit. PPO therefore uses zero bootstrap for both. A genuinely interrupted continuing task would need different reward timing and a nonzero bootstrap. For real RLVR, decide explicitly if unfinished code should receive 0.
-7. PPO/GRPO objectives here are **pedagogical implementations**, not drop-in reproductions of any particular RL paper's complete hyperparameter choices, credit assignment, loss masking, and distributed sampling.
+7. PPO/GRPO/DAPO objectives here are **pedagogical implementations**, not drop-in reproductions of any particular RL paper's complete hyperparameter choices, credit assignment, loss masking, and distributed sampling.
 
-References: [LFM2.5-230M checkpoint](https://huggingface.co/LiquidAI/LFM2.5-230M), [base](https://huggingface.co/LiquidAI/LFM2.5-230M-Base), [Hugging Face LFM2 architecture implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/lfm2/modeling_lfm2.py).
+References: [LFM2.5-230M checkpoint](https://huggingface.co/LiquidAI/LFM2.5-230M), [base](https://huggingface.co/LiquidAI/LFM2.5-230M-Base), [Hugging Face LFM2 architecture implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/lfm2/modeling_lfm2.py), [DAPO paper](https://arxiv.org/abs/2503.14476), [DAPO project](https://github.com/BytedTsinghua-SIA/DAPO).
