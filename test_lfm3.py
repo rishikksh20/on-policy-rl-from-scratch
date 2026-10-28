@@ -5,12 +5,14 @@
     python test_lfm3.py              # checks, download, and generate
     python test_lfm3.py --offline    # checks and generate from local files
 
-Generation defaults match the supplied pipeline example. Edit SAMPLING below
-for advanced settings. Device and dtype are automatic: CUDA/BF16 or CPU/FP32.
+Verified text streams live, with tok/s printed at the end. Prompt-lookup
+speculative decoding is enabled without a second model. Edit SAMPLING and
+SPECULATION below for advanced settings. Device/dtype: CUDA/BF16 or CPU/FP32.
 No Hugging Face runtime libraries are imported. Generation additionally uses
 regex for Unicode tokenization and Jinja2 for the official chat template.
 """
 import argparse
+import codecs
 import contextlib
 import copy
 import functools
@@ -42,6 +44,7 @@ DEFAULT_DIRECTORY = Path(__file__).resolve().parent / 'checkpoints' / 'LFM3-1.7B
 PROMPT = 'What is C. elegans?'
 SAMPLING = dict(max_new_tokens=2048, temperature=0.1, top_k=50,
                 repetition_penalty=1.1, seed=42)
+SPECULATION = dict(enabled=True, max_draft_tokens=4, max_ngram_size=4)
 
 
 # Checkpoint downloads and architecture validation.
@@ -247,15 +250,42 @@ class LocalTokenizer:
                 result.extend(self._encode_piece(section[cursor:]))
         return result
 
+    def token_bytes(self, token_id, skip_special_tokens=True):
+        if skip_special_tokens and token_id in self.special:
+            return b''
+        word = self.ids[token_id]
+        return (word.encode('utf-8') if token_id in self.added_ids
+                else bytes(self.char_bytes[char] for char in word))
+
     def decode(self, ids, skip_special_tokens=True):
-        parts = []
-        for token_id in ids:
-            if skip_special_tokens and token_id in self.special:
-                continue
-            word = self.ids[token_id]
-            parts.append(word.encode('utf-8') if token_id in self.added_ids
-                         else bytes(self.char_bytes[char] for char in word))
-        return b''.join(parts).decode('utf-8', errors='replace')
+        return b''.join(self.token_bytes(i, skip_special_tokens) for i in ids).decode('utf-8', errors='replace')
+
+
+class TokenStreamer:
+    """Flush verified text immediately, preserving UTF-8 split across token IDs."""
+    def __init__(self, tokenizer, stream=None, prefix=''):
+        self.tokenizer = tokenizer
+        self.stream = sys.stdout if stream is None else stream
+        self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        self.prefix = prefix
+        self.started = False
+
+    def _write(self, text):
+        if text:
+            if not self.started:
+                self.stream.write(self.prefix)
+                self.started = True
+            self.stream.write(text)
+            self.stream.flush()
+
+    def put(self, token_id):
+        self._write(self.decoder.decode(self.tokenizer.token_bytes(token_id), final=False))
+
+    def finish(self):
+        self._write(self.decoder.decode(b'', final=True))
+        if self.started:
+            self.stream.write('\n')
+            self.stream.flush()
 
 
 def render_prompt(directory, prompt=PROMPT, enable_thinking=True):
@@ -291,7 +321,24 @@ def render_prompt(directory, prompt=PROMPT, enable_thinking=True):
                            add_generation_prompt=True, tools=None, enable_thinking=enable_thinking)
 
 
-# Autoregressive generation with the local PyTorch backbone and LM head.
+# Streaming and prompt-lookup speculative generation with the local model.
+
+
+def lookup_draft(history, max_tokens, max_ngram_size):
+    """Copy a continuation of the longest repeated suffix (2..max_ngram_size).
+
+    The draft uses already known tokens only. It is a deterministic proposal,
+    not an independent learned draft model. Every token still needs verification.
+    """
+    if max_tokens < 1:
+        return []
+    for size in range(min(max_ngram_size, len(history) - 1), 1, -1):
+        suffix = history[-size:]
+        for start in range(len(history) - size - 1, -1, -1):
+            if history[start:start + size] == suffix:
+                end = start + size
+                return history[end:min(end + max_tokens, len(history))]
+    return []
 
 
 def sample_next_token(logits, history, temperature, top_k, repetition_penalty, generator=None):
@@ -313,37 +360,83 @@ def sample_next_token(logits, history, temperature, top_k, repetition_penalty, g
 
 
 @torch.inference_mode()
-def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, progress=False):
-    """Sample using the local backbone/head, recomputing each prefix without a cache."""
+def generate(model, prompt_ids, *, eos_token_ids, max_new_tokens=None, on_token=None, metrics=None):
+    """Verify prompt-lookup drafts in blocks and stream only committed tokens.
+
+    For a deterministic draft, sampling from the target and accepting a proposed
+    token only when it matches is exact: accept probability is p(draft), and a
+    mismatch is already a sample from p conditioned on not choosing that draft.
+    After a mismatch, later block logits are discarded. No stale cache is kept.
+    """
     max_new_tokens = SAMPLING['max_new_tokens'] if max_new_tokens is None else max_new_tokens
     temperature, top_k, repetition_penalty, seed = (
         SAMPLING[key] for key in ('temperature', 'top_k', 'repetition_penalty', 'seed'))
     if (not prompt_ids or max_new_tokens < 1 or not math.isfinite(temperature) or temperature <= 0
             or not math.isfinite(repetition_penalty) or repetition_penalty <= 0 or top_k < 0):
         raise ValueError('Need a prompt, positive token limit/temperature/penalty, and top_k >= 0')
+    if SPECULATION['max_draft_tokens'] < 1 or SPECULATION['max_ngram_size'] < 2:
+        raise ValueError('Speculation requires positive draft length and n-gram size >= 2')
     device = next(model.parameters()).device
     rng = torch.Generator(device=device).manual_seed(seed)
     generated = []
     eos = {eos_token_ids} if isinstance(eos_token_ids, int) else set(eos_token_ids)
-    started = time.monotonic()
     model.eval()
-    for _ in range(max_new_tokens):
-        ids = torch.tensor([prompt_ids + generated], dtype=torch.long, device=device)
-        if ids.shape[1] > model.model.c['max_position_embeddings']:
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    counts = dict(target_forward_passes=0, speculative_rounds=0,
+                  proposed_draft_tokens=0, accepted_draft_tokens=0)
+    first_token_seconds = None
+    stop = 'max_new_tokens'
+    while len(generated) < max_new_tokens:
+        history = prompt_ids + generated
+        context_room = model.model.c['max_position_embeddings'] - len(history)
+        if context_room < 0:
             raise ValueError('Generation exceeds the configured context length')
-        # Same local policy computation, with the LM head evaluated only at the
-        # last position to avoid allocating [prefix_length, 128000] logits.
+        # Leave room for a target-sampled bonus token when the whole draft matches.
+        draft_limit = min(SPECULATION['max_draft_tokens'], context_room,
+                          max_new_tokens - len(generated) - 1)
+        draft = (lookup_draft(history, draft_limit, SPECULATION['max_ngram_size'])[:draft_limit]
+                 if SPECULATION['enabled'] and draft_limit > 0 else [])
+        for index, token in enumerate(draft):
+            if token in eos:
+                draft = draft[:index + 1]
+                break
+        counts['proposed_draft_tokens'] += len(draft)
+        counts['speculative_rounds'] += bool(draft)
+        ids = torch.tensor([history + draft], dtype=torch.long, device=device)
         hidden = model.model(ids)
-        logits = model.lm_head(hidden[:, -1])[0]
-        token = sample_next_token(logits, prompt_ids + generated, temperature, top_k,
-                                  repetition_penalty, rng)
-        generated.append(token)
-        if progress and (len(generated) == 1 or len(generated) % 16 == 0 or token in eos):
-            print(f'Generated {len(generated)} tokens in {time.monotonic()-started:.1f}s',
-                  file=sys.stderr, flush=True)
-        if token in eos:
-            return generated, 'eos_token'
-    return generated, 'max_new_tokens'
+        # Row i predicts draft[i]; the final row supplies the all-accepted bonus.
+        logits = model.lm_head(hidden[:, -(len(draft) + 1):])[0]
+        counts['target_forward_passes'] += 1
+        for index, row in enumerate(logits):
+            token = sample_next_token(row, history, temperature, top_k, repetition_penalty, rng)
+            is_draft = index < len(draft)
+            matches = is_draft and token == draft[index]
+            counts['accepted_draft_tokens'] += bool(matches)
+            generated.append(token)
+            history.append(token)
+            if first_token_seconds is None:
+                first_token_seconds = time.perf_counter() - started
+            if on_token is not None:
+                on_token(token)  # never expose unverified proposals
+            if token in eos:
+                stop = 'eos_token'
+                break
+            if len(generated) == max_new_tokens or (is_draft and not matches):
+                break
+        if stop == 'eos_token':
+            break
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    if metrics is not None:
+        proposed = counts['proposed_draft_tokens']
+        metrics.update(counts, method='prompt_lookup_speculative' if SPECULATION['enabled'] else 'autoregressive',
+                       elapsed_seconds=elapsed, tokens_per_second=len(generated) / elapsed,
+                       time_to_first_token_seconds=first_token_seconds,
+                       draft_acceptance_rate=counts['accepted_draft_tokens'] / proposed if proposed else 0.0)
+    return generated, stop
 
 
 def split_response(text, enable_thinking):
@@ -378,13 +471,21 @@ def run_generation(prompt=PROMPT, max_new_tokens=None, offline=False):
         raise RuntimeError('Unexpected model parameter count')
     if model.lm_head.weight is not model.model.embed_tokens.weight:
         raise RuntimeError('Input/output embedding weights must remain tied')
-    started = time.monotonic()
     settings = dict(SAMPLING)
     if max_new_tokens is not None:
         settings['max_new_tokens'] = max_new_tokens
     generation_config = read_json(directory / 'generation_config.json')
+    performance = {}
+    streamer = TokenStreamer(tokenizer, prefix='<think>')
     generated, stop = generate(model, prompt_ids, eos_token_ids=generation_config['eos_token_id'],
-                               max_new_tokens=settings['max_new_tokens'], progress=True)
+                               max_new_tokens=settings['max_new_tokens'], on_token=streamer.put,
+                               metrics=performance)
+    streamer.finish()
+    print(f'Speed: {performance["tokens_per_second"]:.2f} tok/s | '
+          f'{len(generated)} tokens in {performance["elapsed_seconds"]:.2f}s', file=sys.stderr, flush=True)
+    print(f'Speculation: {performance["accepted_draft_tokens"]}/{performance["proposed_draft_tokens"]} '
+          f'draft tokens accepted; {performance["target_forward_passes"]} target passes',
+          file=sys.stderr, flush=True)
     raw_text = tokenizer.decode(generated)
     if not raw_text.strip():
         raise RuntimeError('Generation produced no text')
@@ -393,12 +494,13 @@ def run_generation(prompt=PROMPT, max_new_tokens=None, offline=False):
                   messages=[dict(role='user', content=prompt)], sampling=dict(do_sample=True, **settings),
                   prompt_text=prompt_text, prompt_ids=prompt_ids, generated_ids=generated,
                   generated_text=raw_text, assistant_content=content, reasoning_content=reasoning,
-                  stop_reason=stop, generated_tokens=len(generated), elapsed_seconds=time.monotonic()-started,
+                  stop_reason=stop, generated_tokens=len(generated),
+                  elapsed_seconds=performance['elapsed_seconds'], tokens_per_second=performance['tokens_per_second'],
+                  decoding=dict(SPECULATION), performance=performance,
                   checks=dict(config_matches=True, checkpoint_loaded=True, tied_embeddings=True,
                               tokenizer_roundtrip=True, finite_logits=True))
     output = directory / 'generation_result.json'
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print(content if content else raw_text, flush=True)
     print(f'Saved generation and checks to {output}; stop={stop}', file=sys.stderr, flush=True)
     if not content:
         print('The token limit was reached during reasoning; assistant_content is empty. '
@@ -462,6 +564,25 @@ def reference_attention(layer, x, positions):
     out = (probs @ v).transpose(1, 2)
     out = out * torch.sigmoid(layer.gate_proj(x)).unsqueeze(-1)
     return layer.o_proj(out.reshape(b, t, -1))
+
+
+def cycle_policy(scale=80.0, context=128):
+    """Small Markov policy for exact speculative acceptance/rejection tests."""
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+            self.c = dict(max_position_embeddings=context)
+            self.calls = []
+
+        def forward(self, ids):
+            self.calls.append(ids.clone())
+            return F.one_hot(ids.remainder(3) + 1, num_classes=4).float() * scale + self.anchor
+
+    model = torch.nn.Module()
+    model.model = Backbone()
+    model.lm_head = torch.nn.Identity()
+    return model
 
 
 class SeededTestCase(unittest.TestCase):
@@ -872,6 +993,83 @@ class GenerationTests(SeededTestCase):
                          ('', 'unfinished reasoning'))
         self.assertEqual(split_response(' answer ', False), ('answer', None))
 
+    def test_stream_flushes_before_finish_and_preserves_split_utf8(self):
+        class BytesTokenizer:
+            def token_bytes(self, token):
+                return [b'hello ', b'\xf0', b'\x9f\x8c', b'\x8d', b'', b'!'][token]
+
+        output = io.StringIO()
+        streamer = TokenStreamer(BytesTokenizer(), stream=output, prefix='<think>')
+        with patch.object(output, 'flush', wraps=output.flush) as flush:
+            streamer.put(0)
+            self.assertEqual(output.getvalue(), '<think>hello ')
+            flush.assert_called_once()
+            streamer.put(1)
+            streamer.put(2)
+            self.assertNotIn('\ufffd', output.getvalue())
+            streamer.put(3)
+            self.assertEqual(output.getvalue(), '<think>hello 🌍')
+            streamer.put(4)  # skipped special token
+            streamer.put(5)
+            streamer.finish()
+        self.assertEqual(output.getvalue(), '<think>hello 🌍!\n')
+
+    def test_lookup_uses_earlier_context_and_never_self_matches(self):
+        self.assertEqual(lookup_draft([1, 2, 3, 1, 2, 3], 4, 4), [1, 2, 3])
+        self.assertEqual(lookup_draft([1, 2, 3, 1, 2, 3], 1, 4), [1])
+        self.assertEqual(lookup_draft([1, 2, 3], 4, 4), [])
+        self.assertEqual(lookup_draft([1, 2, 3, 1, 2, 3], 0, 4), [])
+
+    def test_speculative_blocks_reduce_passes_and_stream_committed_tokens(self):
+        model, metrics, streamed = cycle_policy(), {}, []
+        tokens, stop = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0],
+                                max_new_tokens=8, on_token=streamed.append, metrics=metrics)
+        self.assertEqual(tokens, [1, 2, 3, 1, 2, 3, 1, 2])
+        self.assertEqual(streamed, tokens)
+        self.assertEqual(stop, 'max_new_tokens')
+        self.assertLess(metrics['target_forward_passes'], len(tokens))
+        self.assertEqual(metrics['target_forward_passes'], len(model.model.calls))
+        self.assertGreater(metrics['accepted_draft_tokens'], 0)
+        self.assertGreater(metrics['tokens_per_second'], 0)
+        self.assertAlmostEqual(metrics['tokens_per_second'], len(tokens) / metrics['elapsed_seconds'])
+
+    def test_rejected_drafts_are_discarded_before_the_next_forward_or_stream(self):
+        model, metrics, streamed = cycle_policy(), {}, []
+        # The first two proposals are wrong: the target must emit 1, then 2.
+        with patch.object(sys.modules[__name__], 'lookup_draft', return_value=[3, 3, 3]):
+            tokens, _ = generate(model, [1, 2, 3], eos_token_ids=[0], max_new_tokens=6,
+                                  on_token=streamed.append, metrics=metrics)
+        self.assertEqual(tokens, [1, 2, 3, 1, 2, 3])
+        self.assertEqual(streamed, tokens)
+        self.assertEqual(model.model.calls[1][0, :4].tolist(), [1, 2, 3, 1])
+        self.assertLess(metrics['accepted_draft_tokens'], metrics['proposed_draft_tokens'])
+
+    def test_speculative_sampling_matches_sequential_draws_with_penalties(self):
+        prompt = [1, 2, 3, 1, 2, 3]
+        for seed in range(10):
+            with self.subTest(seed=seed), patch.dict(SAMPLING, temperature=0.8, top_k=3,
+                                                    repetition_penalty=1.5, seed=seed):
+                with patch.dict(SPECULATION, enabled=False):
+                    expected, expected_stop = generate(cycle_policy(scale=1.1), prompt,
+                                                       eos_token_ids=[0], max_new_tokens=24)
+                with patch.dict(SPECULATION, enabled=True):
+                    actual, stop = generate(cycle_policy(scale=1.1), prompt,
+                                            eos_token_ids=[0], max_new_tokens=24)
+                self.assertEqual(actual, expected)
+                self.assertEqual(stop, expected_stop)
+
+    def test_speculation_stops_on_eos_inside_a_draft_and_respects_context(self):
+        streamed = []
+        tokens, stop = generate(cycle_policy(), [1, 2, 3, 1, 2, 3], eos_token_ids=[2],
+                                max_new_tokens=8, on_token=streamed.append)
+        self.assertEqual((tokens, stop), ([1, 2], 'eos_token'))
+        self.assertEqual(streamed, [1, 2])
+        # Exactly one context position remains; the block must be clipped to fit.
+        model = cycle_policy(context=7)
+        tokens, _ = generate(model, [1, 2, 3, 1, 2, 3], eos_token_ids=[0], max_new_tokens=2)
+        self.assertEqual(tokens, [1, 2])
+        self.assertTrue(all(ids.shape[1] <= 7 for ids in model.model.calls))
+
 
 class RunnerTests(SeededTestCase):
     def test_command_modes_run_checks_before_generation(self):
@@ -918,7 +1116,7 @@ def run_unit_tests():
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Run LFM3 checks, then generate with the local PyTorch model.',
-        epilog='Advanced defaults live in SAMPLING and DEFAULT_DIRECTORY at the top of this file.')
+        epilog='Advanced defaults live in SAMPLING, SPECULATION, and DEFAULT_DIRECTORY at the top of this file.')
     parser.add_argument('--unit', action='store_true', help='Run only the fast offline tests; requires only torch')
     parser.add_argument('--offline', action='store_true', help='Generate using verified local files without network access')
     parser.add_argument('--prompt', default=PROMPT, help=f'User message (default: {PROMPT})')
