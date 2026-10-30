@@ -8,7 +8,6 @@ import json
 import math
 from pathlib import Path
 import struct
-
 import torch
 from torch import nn
 import torch.nn.functional as F
